@@ -18,7 +18,7 @@ void setup()
 
         while (true)
         {
-            delay(100);
+            yield();
         }
     }
 

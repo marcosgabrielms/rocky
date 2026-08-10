@@ -25,6 +25,12 @@ void Eyes::update(uint32_t now)
     gazeY = approach(gazeY, targetGazeY, GAZE_SPEED * elapsedSeconds);
     blinkAmount = approach(blinkAmount, targetBlinkAmount, BLINK_SPEED * elapsedSeconds);
 
+    if (attentionConfirming && now - attentionStartedAt >= ATTENTION_CONFIRMATION_DURATION_MS)
+    {
+        attentionConfirming = false;
+        redrawRequested = true;
+    }
+
     const bool isAnimating = gazeX != targetGazeX || gazeY != targetGazeY ||
                              blinkAmount != targetBlinkAmount;
 
@@ -61,6 +67,17 @@ void Eyes::lookCenter()
     setGaze(0, 0);
 }
 
+void Eyes::setGazeOffset(int16_t x, int16_t y)
+{
+    const int16_t limitedX = std::max<int16_t>(
+        -MAX_GAZE_X,
+        std::min<int16_t>(x, MAX_GAZE_X));
+    const int16_t limitedY = std::max<int16_t>(
+        -MAX_GAZE_Y,
+        std::min<int16_t>(y, MAX_GAZE_Y));
+    setGaze(limitedX, limitedY);
+}
+
 void Eyes::setBlinking(bool blinking)
 {
     targetBlinkAmount = blinking ? 1.0F : 0.0F;
@@ -73,6 +90,12 @@ void Eyes::setVisualState(VisualState newState)
         return;
 
     visualState = newState;
+    attentionStartedAt = millis();
+    attentionConfirming = newState == VisualState::Attention;
+
+    if (newState == VisualState::Attention)
+        lookCenter();
+
     redrawRequested = true;
 }
 
@@ -80,6 +103,11 @@ void Eyes::setMood(Mood newMood)
 {
     mood = newMood;
     redrawRequested = true;
+}
+
+bool Eyes::isAttentionConfirming() const
+{
+    return attentionConfirming;
 }
 
 void Eyes::setGaze(int16_t x, int16_t y)
@@ -91,12 +119,18 @@ void Eyes::setGaze(int16_t x, int16_t y)
 
 void Eyes::draw() const
 {
-    const int16_t baseEyeHeight = visualState == VisualState::Listening
-                                      ? LISTENING_EYE_HEIGHT
-                                      : EYE_HEIGHT;
+    if (attentionConfirming)
+    {
+        display.clear();
+        drawAttentionConfirmation();
+        display.show();
+        return;
+    }
+
+    const int16_t baseHeight = baseEyeHeight();
     const int16_t height = std::max(
         MIN_EYE_HEIGHT,
-        static_cast<int16_t>(std::lround(baseEyeHeight * (1.0F - blinkAmount))));
+        static_cast<int16_t>(std::lround(baseHeight * (1.0F - blinkAmount))));
     const int16_t y = EYE_CENTER_Y + static_cast<int16_t>(std::lround(gazeY)) - height / 2;
     const int16_t leftX = LEFT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - EYE_WIDTH / 2;
     const int16_t rightX = RIGHT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - EYE_WIDTH / 2;
@@ -106,6 +140,35 @@ void Eyes::draw() const
     display.fillRoundRect(leftX, y, EYE_WIDTH, height, radius);
     display.fillRoundRect(rightX, y, EYE_WIDTH, height, radius);
     display.show();
+}
+
+void Eyes::drawAttentionConfirmation() const
+{
+    constexpr int16_t CARET_HALF_WIDTH = 8;
+    constexpr int16_t CARET_HEIGHT = 8;
+
+    const int16_t apexY = EYE_CENTER_Y - CARET_HEIGHT / 2;
+    const int16_t baseY = apexY + CARET_HEIGHT;
+
+    display.drawLine(LEFT_EYE_CENTER_X - CARET_HALF_WIDTH, baseY,
+                     LEFT_EYE_CENTER_X, apexY);
+    display.drawLine(LEFT_EYE_CENTER_X, apexY,
+                     LEFT_EYE_CENTER_X + CARET_HALF_WIDTH, baseY);
+    display.drawLine(RIGHT_EYE_CENTER_X - CARET_HALF_WIDTH, baseY,
+                     RIGHT_EYE_CENTER_X, apexY);
+    display.drawLine(RIGHT_EYE_CENTER_X, apexY,
+                     RIGHT_EYE_CENTER_X + CARET_HALF_WIDTH, baseY);
+}
+
+int16_t Eyes::baseEyeHeight() const
+{
+    if (visualState == VisualState::Listening)
+        return LISTENING_EYE_HEIGHT;
+
+    if (visualState == VisualState::Attention)
+        return ATTENTION_EYE_HEIGHT;
+
+    return EYE_HEIGHT;
 }
 
 float Eyes::approach(float current, float target, float maximumStep)

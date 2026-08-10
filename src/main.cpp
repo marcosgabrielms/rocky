@@ -19,12 +19,42 @@ namespace
 {
 constexpr size_t MIC_BLOCK_SAMPLES = 64;
 constexpr uint32_t MIC_REPORT_INTERVAL_MS = 250;
+constexpr uint32_t VISUAL_TEST_CYCLE_MS = 20000;
+constexpr uint32_t IDLE_TEST_DURATION_MS = 5000;
+constexpr uint32_t ATTENTION_TEST_DURATION_MS = 10000;
+constexpr uint32_t LISTENING_TEST_DURATION_MS = 15000;
 
 int32_t micSamples[MIC_BLOCK_SAMPLES];
 uint64_t micSumOfSquares = 0;
 int64_t micSum = 0;
 size_t micSampleCount = 0;
 uint32_t lastMicReportAt = 0;
+uint32_t visualTestStartedAt = 0;
+
+void updateTemporaryVisualTest(uint32_t now)
+{
+    const uint32_t elapsed = (now - visualTestStartedAt) % VISUAL_TEST_CYCLE_MS;
+
+    if (elapsed < IDLE_TEST_DURATION_MS)
+    {
+        animator.setVisualState(Eyes::VisualState::Idle);
+        return;
+    }
+
+    if (elapsed < ATTENTION_TEST_DURATION_MS)
+    {
+        animator.setVisualState(Eyes::VisualState::Attention);
+        return;
+    }
+
+    if (elapsed < LISTENING_TEST_DURATION_MS)
+    {
+        animator.setVisualState(Eyes::VisualState::Listening);
+        return;
+    }
+
+    animator.setVisualState(Eyes::VisualState::Idle);
+}
 
 void accumulateMicrophoneSamples(const int32_t* samples, size_t sampleCount)
 {
@@ -81,14 +111,14 @@ void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
     if (voiceActivityDetector.didSpeechStart())
     {
         speechCapture.start();
-        eyes.setVisualState(Eyes::VisualState::Listening);
+        animator.setVisualState(Eyes::VisualState::Listening);
         Serial.println("[VAD] Speech started");
     }
 
     if (voiceActivityDetector.didSpeechEnd())
     {
         speechCapture.finish();
-        eyes.setVisualState(Eyes::VisualState::Idle);
+        animator.setVisualState(Eyes::VisualState::Idle);
         Serial.println("[VAD] Speech ended");
     }
 
@@ -140,6 +170,7 @@ void setup()
     voiceActivityDetector.begin();
     speechCapture.begin();
     lastMicReportAt = millis();
+    visualTestStartedAt = lastMicReportAt;
 }
 
 void loop()
@@ -147,10 +178,10 @@ void loop()
     if (!displayReady)
         return;
 
-    animator.update();
-
     if (microphone.available())
         processMicrophoneSamples(micSamples, microphone.readSamples(micSamples, MIC_BLOCK_SAMPLES));
 
+    updateTemporaryVisualTest(millis());
+    animator.update();
     reportMicrophoneLevel(millis());
 }

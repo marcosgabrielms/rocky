@@ -36,3 +36,8 @@ void Display::fillRoundRect(int16_t x,
 {
     oled.fillRoundRect(x, y, width, height, radius, SSD1306_WHITE);
 }
+
+void Display::drawLine(int16_t x1, int16_t y1, int16_t x2, int16_t y2)
+{
+    oled.drawLine(x1, y1, x2, y2, SSD1306_WHITE);
+}

@@ -21,6 +21,23 @@ void Animator::update()
     eyes.update(now);
 }
 
+void Animator::setVisualState(Eyes::VisualState newState)
+{
+    if (visualState == newState)
+        return;
+
+    visualState = newState;
+    eyes.setVisualState(newState);
+
+    if (visualState == Eyes::VisualState::Attention)
+    {
+        attentionGazeIndex = 0;
+        eyes.lookCenter();
+    }
+
+    lastGazeChangeAt = millis();
+}
+
 void Animator::updateBlink(uint32_t now)
 {
     const uint32_t elapsed = now - stateStartedAt;
@@ -50,10 +67,21 @@ void Animator::updateBlink(uint32_t now)
 
 void Animator::updateGaze(uint32_t now)
 {
-    if (now - lastGazeChangeAt < GAZE_INTERVAL_MS)
+    if (visualState == Eyes::VisualState::Attention && eyes.isAttentionConfirming())
         return;
 
-    applyNextGaze();
+    const uint32_t interval = visualState == Eyes::VisualState::Attention
+                                  ? ATTENTION_GAZE_INTERVAL_MS
+                                  : GAZE_INTERVAL_MS;
+
+    if (now - lastGazeChangeAt < interval)
+        return;
+
+    if (visualState == Eyes::VisualState::Attention)
+        applyNextAttentionGaze();
+    else
+        applyNextGaze();
+
     lastGazeChangeAt = now;
 }
 
@@ -72,6 +100,28 @@ void Animator::applyNextGaze()
         break;
     case 3:
         eyes.lookDown();
+        break;
+    default:
+        eyes.lookCenter();
+        break;
+    }
+}
+
+void Animator::applyNextAttentionGaze()
+{
+    switch (attentionGazeIndex++ % 5)
+    {
+    case 0:
+        eyes.setGazeOffset(-2, 0);
+        break;
+    case 1:
+        eyes.setGazeOffset(1, -1);
+        break;
+    case 2:
+        eyes.setGazeOffset(2, 0);
+        break;
+    case 3:
+        eyes.setGazeOffset(-1, 1);
         break;
     default:
         eyes.lookCenter();

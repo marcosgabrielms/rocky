@@ -24,6 +24,8 @@ public:
                        int16_t height,
                        int16_t radius);
 
+    void drawLine(int16_t x1, int16_t y1, int16_t x2, int16_t y2);
+
 private:
 
     static constexpr uint8_t WIDTH = 128;

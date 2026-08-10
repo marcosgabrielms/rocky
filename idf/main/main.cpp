@@ -7,6 +7,8 @@
 #include "esp_log.h"
 #include "esp_psram.h"
 
+#include "drivers/Display.h"
+
 namespace {
 
 constexpr const char *TAG = "ROCKY_IDF";
@@ -35,5 +37,27 @@ extern "C" void app_main(void) {
              static_cast<unsigned>(psramBytes / BYTES_PER_MEGABYTE));
     ESP_LOGI(TAG, "[MEM] internal=%u", static_cast<unsigned>(internalFree));
     ESP_LOGI(TAG, "[MEM] psram=%u", static_cast<unsigned>(psramFree));
+
+    Display display;
+    if (!display.begin()) {
+        ESP_LOGE(TAG, "[DISPLAY] initialization failed; stopping display test");
+        return;
+    }
+    display.clear();
+    if (!display.show()) {
+        ESP_LOGE(TAG, "[DISPLAY] blank framebuffer transfer failed");
+        return;
+    }
+    display.fillRoundRect(32, 16, 64, 32, 8);
+    if (!display.show()) {
+        ESP_LOGE(TAG, "[DISPLAY] test pattern transfer failed");
+        return;
+    }
+
+    ESP_LOGI(TAG, "[DISPLAY] Test pattern: displayed");
+    ESP_LOGI(TAG, "[MEM] after_display internal=%u", static_cast<unsigned>(
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+    ESP_LOGI(TAG, "[MEM] after_display psram=%u", static_cast<unsigned>(
+                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
     ESP_LOGI(TAG, "[BOOT] ESP-IDF base OK");
 }

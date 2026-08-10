@@ -3,6 +3,12 @@
 #include <algorithm>
 #include <cmath>
 
+namespace
+{
+constexpr int16_t LISTENING_EYE_SIZE = 36;
+constexpr int16_t LISTENING_EYE_RADIUS = 4;
+}
+
 Eyes::Eyes(Display& display)
     : display(display)
 {
@@ -127,18 +133,20 @@ void Eyes::draw() const
         return;
     }
 
+    const bool isListening = visualState == VisualState::Listening;
+    const int16_t width = isListening ? LISTENING_EYE_SIZE : EYE_WIDTH;
     const int16_t baseHeight = baseEyeHeight();
     const int16_t height = std::max(
         MIN_EYE_HEIGHT,
         static_cast<int16_t>(std::lround(baseHeight * (1.0F - blinkAmount))));
     const int16_t y = EYE_CENTER_Y + static_cast<int16_t>(std::lround(gazeY)) - height / 2;
-    const int16_t leftX = LEFT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - EYE_WIDTH / 2;
-    const int16_t rightX = RIGHT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - EYE_WIDTH / 2;
-    const int16_t radius = cornerRadius(height);
+    const int16_t leftX = LEFT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - width / 2;
+    const int16_t rightX = RIGHT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - width / 2;
+    const int16_t radius = isListening ? LISTENING_EYE_RADIUS : cornerRadius(height);
 
     display.clear();
-    display.fillRoundRect(leftX, y, EYE_WIDTH, height, radius);
-    display.fillRoundRect(rightX, y, EYE_WIDTH, height, radius);
+    display.fillRoundRect(leftX, y, width, height, radius);
+    display.fillRoundRect(rightX, y, width, height, radius);
     display.show();
 }
 
@@ -163,7 +171,7 @@ void Eyes::drawAttentionConfirmation() const
 int16_t Eyes::baseEyeHeight() const
 {
     if (visualState == VisualState::Listening)
-        return LISTENING_EYE_HEIGHT;
+        return LISTENING_EYE_SIZE;
 
     if (visualState == VisualState::Attention)
         return ATTENTION_EYE_HEIGHT;

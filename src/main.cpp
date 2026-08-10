@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_heap_caps.h>
 
 #include "drivers/Display.h"
 #include "drivers/Microphone.h"
@@ -19,41 +20,30 @@ namespace
 {
 constexpr size_t MIC_BLOCK_SAMPLES = 64;
 constexpr uint32_t MIC_REPORT_INTERVAL_MS = 250;
-constexpr uint32_t VISUAL_TEST_CYCLE_MS = 20000;
-constexpr uint32_t IDLE_TEST_DURATION_MS = 5000;
-constexpr uint32_t ATTENTION_TEST_DURATION_MS = 10000;
-constexpr uint32_t LISTENING_TEST_DURATION_MS = 15000;
 
 int32_t micSamples[MIC_BLOCK_SAMPLES];
 uint64_t micSumOfSquares = 0;
 int64_t micSum = 0;
 size_t micSampleCount = 0;
 uint32_t lastMicReportAt = 0;
-uint32_t visualTestStartedAt = 0;
 
-void updateTemporaryVisualTest(uint32_t now)
+void reportBootMemory()
 {
-    const uint32_t elapsed = (now - visualTestStartedAt) % VISUAL_TEST_CYCLE_MS;
+    Serial.println("[MEMORY]");
+    Serial.printf("psram_found=%s\n", psramFound() ? "yes" : "no");
+    Serial.printf("flash_size=%u\n", static_cast<unsigned>(ESP.getFlashChipSize()));
+    Serial.printf("psram_size=%u\n", static_cast<unsigned>(ESP.getPsramSize()));
+    Serial.printf("psram_free=%u\n", static_cast<unsigned>(ESP.getFreePsram()));
+}
 
-    if (elapsed < IDLE_TEST_DURATION_MS)
-    {
-        animator.setVisualState(Eyes::VisualState::Idle);
-        return;
-    }
-
-    if (elapsed < ATTENTION_TEST_DURATION_MS)
-    {
-        animator.setVisualState(Eyes::VisualState::Attention);
-        return;
-    }
-
-    if (elapsed < LISTENING_TEST_DURATION_MS)
-    {
-        animator.setVisualState(Eyes::VisualState::Listening);
-        return;
-    }
-
-    animator.setVisualState(Eyes::VisualState::Idle);
+void reportCaptureMemory(const char* stage)
+{
+    const size_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t psramFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    Serial.printf("[MEM] %s internal=%u psram=%u\n",
+                  stage,
+                  static_cast<unsigned>(internalFree),
+                  static_cast<unsigned>(psramFree));
 }
 
 void accumulateMicrophoneSamples(const int32_t* samples, size_t sampleCount)
@@ -92,11 +82,23 @@ void reportCompletedSpeech()
     if (!speechCapture.consumeCompleted())
         return;
 
-    Serial.printf("[SPEECH] samples=%u\n",
+    const SpeechCapture::Pcm16Metrics& metrics = speechCapture.getMetrics();
+
+    Serial.println("[SPEECH]");
+    Serial.printf("samples=%u\n",
                   static_cast<unsigned>(speechCapture.getSampleCount()));
-    Serial.printf("[SPEECH] duration=%lu ms%s\n",
+    Serial.printf("duration_ms=%lu%s\n",
                   static_cast<unsigned long>(speechCapture.getDurationMs()),
                   speechCapture.wasLimited() ? " (maximum reached)" : "");
+    Serial.printf("pcm_bytes=%u\n", static_cast<unsigned>(speechCapture.getPcmByteCount()));
+    Serial.println("format=PCM16 mono 16000Hz");
+    Serial.printf("min=%d max=%d mean=%ld rms=%lu clipping=%u\n",
+                  metrics.minimum,
+                  metrics.maximum,
+                  static_cast<long>(metrics.mean),
+                  static_cast<unsigned long>(metrics.rms),
+                  static_cast<unsigned>(metrics.clippingCount));
+    reportCaptureMemory("after_capture");
 }
 
 void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
@@ -110,16 +112,19 @@ void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
 
     if (voiceActivityDetector.didSpeechStart())
     {
+        reportCaptureMemory("before_capture");
         speechCapture.start();
+        Serial.println("[VAD] SILENCE -> SPEECH");
         animator.setVisualState(Eyes::VisualState::Listening);
-        Serial.println("[VAD] Speech started");
+        Serial.println("[VISUAL] IDLE -> LISTENING");
     }
 
     if (voiceActivityDetector.didSpeechEnd())
     {
         speechCapture.finish();
+        Serial.println("[VAD] SPEECH -> SILENCE");
         animator.setVisualState(Eyes::VisualState::Idle);
-        Serial.println("[VAD] Speech ended");
+        Serial.println("[VISUAL] LISTENING -> IDLE");
     }
 
     reportCompletedSpeech();
@@ -149,6 +154,7 @@ void reportMicrophoneLevel(uint32_t now)
 void setup()
 {
     Serial.begin(115200);
+    reportBootMemory();
 
     if (!display.begin())
     {
@@ -168,9 +174,11 @@ void setup()
 
     Serial.println("INMP441 inicializado.");
     voiceActivityDetector.begin();
-    speechCapture.begin();
+    if (!speechCapture.begin())
+        Serial.println("Falha ao alocar buffer de captura na PSRAM.");
+    else
+        Serial.println("Buffer de captura PCM16 alocado na PSRAM.");
     lastMicReportAt = millis();
-    visualTestStartedAt = lastMicReportAt;
 }
 
 void loop()
@@ -181,7 +189,6 @@ void loop()
     if (microphone.available())
         processMicrophoneSamples(micSamples, microphone.readSamples(micSamples, MIC_BLOCK_SAMPLES));
 
-    updateTemporaryVisualTest(millis());
     animator.update();
     reportMicrophoneLevel(millis());
 }

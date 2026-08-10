@@ -29,10 +29,13 @@ void Animator::setVisualState(Eyes::VisualState newState)
     visualState = newState;
     eyes.setVisualState(newState);
 
-    if (visualState == Eyes::VisualState::Attention)
+    if (visualState == Eyes::VisualState::Attention ||
+        visualState == Eyes::VisualState::Listening)
     {
-        attentionGazeIndex = 0;
         eyes.lookCenter();
+
+        if (visualState == Eyes::VisualState::Attention)
+            attentionGazeIndex = 0;
     }
 
     lastGazeChangeAt = millis();
@@ -68,6 +71,9 @@ void Animator::updateBlink(uint32_t now)
 void Animator::updateGaze(uint32_t now)
 {
     if (visualState == Eyes::VisualState::Attention && eyes.isAttentionConfirming())
+        return;
+
+    if (visualState == Eyes::VisualState::Listening)
         return;
 
     const uint32_t interval = visualState == Eyes::VisualState::Attention

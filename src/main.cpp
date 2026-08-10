@@ -7,6 +7,7 @@
 #include "audio/VoiceActivityDetector.h"
 #include "graphics/Eyes.h"
 #include "graphics/Animator.h"
+#include "network/WifiManager.h"
 
 Display display;
 Microphone microphone;
@@ -14,6 +15,7 @@ VoiceActivityDetector voiceActivityDetector;
 SpeechCapture speechCapture;
 Eyes eyes(display);
 Animator animator(eyes);
+WifiManager wifiManager;
 bool displayReady = false;
 
 namespace
@@ -178,6 +180,8 @@ void setup()
         Serial.println("Falha ao alocar buffer de captura na PSRAM.");
     else
         Serial.println("Buffer de captura PCM16 alocado na PSRAM.");
+
+    wifiManager.begin();
     lastMicReportAt = millis();
 }
 
@@ -189,6 +193,7 @@ void loop()
     if (microphone.available())
         processMicrophoneSamples(micSamples, microphone.readSamples(micSamples, MIC_BLOCK_SAMPLES));
 
+    wifiManager.update();
     animator.update();
     reportMicrophoneLevel(millis());
 }

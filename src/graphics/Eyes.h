@@ -7,6 +7,12 @@
 class Eyes
 {
 public:
+    enum class VisualState : uint8_t
+    {
+        Idle,
+        Listening
+    };
+
     enum class Mood : uint8_t
     {
         Neutral,
@@ -25,6 +31,7 @@ public:
     void lookDown();
     void lookCenter();
     void setBlinking(bool blinking);
+    void setVisualState(VisualState state);
     void setMood(Mood mood);
 
 private:
@@ -33,6 +40,7 @@ private:
     static constexpr int16_t EYE_CENTER_Y = 32;
     static constexpr int16_t EYE_WIDTH = 36;
     static constexpr int16_t EYE_HEIGHT = 42;
+    static constexpr int16_t LISTENING_EYE_HEIGHT = 28;
     static constexpr int16_t MIN_EYE_HEIGHT = 3;
     static constexpr int16_t MAX_GAZE_X = 7;
     static constexpr int16_t MAX_GAZE_Y = 5;
@@ -41,6 +49,7 @@ private:
     static constexpr uint32_t FRAME_INTERVAL_MS = 16;
 
     Display& display;
+    VisualState visualState = VisualState::Idle;
     Mood mood = Mood::Neutral;
     float gazeX = 0.0F;
     float gazeY = 0.0F;

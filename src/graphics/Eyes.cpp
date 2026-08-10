@@ -67,6 +67,15 @@ void Eyes::setBlinking(bool blinking)
     redrawRequested = true;
 }
 
+void Eyes::setVisualState(VisualState newState)
+{
+    if (visualState == newState)
+        return;
+
+    visualState = newState;
+    redrawRequested = true;
+}
+
 void Eyes::setMood(Mood newMood)
 {
     mood = newMood;
@@ -82,9 +91,12 @@ void Eyes::setGaze(int16_t x, int16_t y)
 
 void Eyes::draw() const
 {
+    const int16_t baseEyeHeight = visualState == VisualState::Listening
+                                      ? LISTENING_EYE_HEIGHT
+                                      : EYE_HEIGHT;
     const int16_t height = std::max(
         MIN_EYE_HEIGHT,
-        static_cast<int16_t>(std::lround(EYE_HEIGHT * (1.0F - blinkAmount))));
+        static_cast<int16_t>(std::lround(baseEyeHeight * (1.0F - blinkAmount))));
     const int16_t y = EYE_CENTER_Y + static_cast<int16_t>(std::lround(gazeY)) - height / 2;
     const int16_t leftX = LEFT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - EYE_WIDTH / 2;
     const int16_t rightX = RIGHT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - EYE_WIDTH / 2;

@@ -21,13 +21,13 @@ void Animator::update()
     eyes.update(now);
 }
 
-void Animator::setVisualState(Eyes::VisualState newState)
+void Animator::setVisualState(Eyes::VisualState newState, bool showConfirmation)
 {
     if (visualState == newState)
         return;
 
     visualState = newState;
-    eyes.setVisualState(newState);
+    eyes.setVisualState(newState, showConfirmation);
 
     if (visualState == Eyes::VisualState::Attention ||
         visualState == Eyes::VisualState::Listening)

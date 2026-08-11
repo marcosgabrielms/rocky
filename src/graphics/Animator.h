@@ -11,7 +11,7 @@ public:
 
     void begin();
     void update();
-    void setVisualState(Eyes::VisualState state);
+    void setVisualState(Eyes::VisualState state, bool showConfirmation = true);
 
 private:
     enum class BlinkState : uint8_t

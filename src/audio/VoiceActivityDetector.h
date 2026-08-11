@@ -6,9 +6,9 @@ class VoiceActivityDetector
 {
 public:
     // Ajuste estes quatro valores durante a calibração no hardware.
-    static constexpr float THRESHOLD_ON = 12000.0F;
-    static constexpr float THRESHOLD_OFF = 8000.0F;
-    static constexpr uint32_t ATTACK_TIME_MS = 150;
+    static constexpr float THRESHOLD_ON = 10000.0F;
+    static constexpr float THRESHOLD_OFF = 7000.0F;
+    static constexpr uint32_t ATTACK_TIME_MS = 100;
     static constexpr uint32_t RELEASE_TIME_MS = 450;
 
     void begin();

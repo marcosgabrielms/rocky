@@ -90,14 +90,14 @@ void Eyes::setBlinking(bool blinking)
     redrawRequested = true;
 }
 
-void Eyes::setVisualState(VisualState newState)
+void Eyes::setVisualState(VisualState newState, bool showConfirmation)
 {
     if (visualState == newState)
         return;
 
     visualState = newState;
     attentionStartedAt = millis();
-    attentionConfirming = newState == VisualState::Attention;
+    attentionConfirming = newState == VisualState::Attention && showConfirmation;
 
     if (newState == VisualState::Attention)
         lookCenter();

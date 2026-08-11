@@ -33,6 +33,15 @@ void writeLittleEndian32(uint8_t* destination, uint32_t value)
     destination[2] = static_cast<uint8_t>((value >> 16) & 0xFF);
     destination[3] = static_cast<uint8_t>((value >> 24) & 0xFF);
 }
+
+void appendMultipartField(String& prefix, const char* name, const String& value)
+{
+    prefix += "------RockyBoundary\r\nContent-Disposition: form-data; name=\"";
+    prefix += name;
+    prefix += "\"\r\n\r\n";
+    prefix += value;
+    prefix += "\r\n";
+}
 } // namespace
 
 bool SttClient::checkHealth()
@@ -125,6 +134,33 @@ bool SttClient::uploadDataset(const int16_t* pcm16, size_t pcmByteCount, const c
     return statusCode == 200 && extractIndex(body, index);
 }
 
+bool SttClient::uploadCalibration(const int16_t* pcm16,
+                                  size_t pcmByteCount,
+                                  const CalibrationMetadata& metadata,
+                                  String& filename)
+{
+    WiFiClient client;
+    client.setTimeout(HTTP_TIMEOUT_MS);
+    if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) ||
+        !sendCalibrationRequest(client, pcm16, pcmByteCount, metadata))
+    {
+        Serial.println("[CAL] upload error=connection");
+        client.stop();
+        return false;
+    }
+
+    const int statusCode = readStatusCode(client);
+    const String body = readResponseBody(client);
+    client.stop();
+    if (statusCode != 200 || !extractJsonString(body, "filename", filename))
+    {
+        Serial.printf("[CAL] upload error=http_%d\n", statusCode);
+        return false;
+    }
+
+    return true;
+}
+
 bool SttClient::sendGetRequest(WiFiClient& client) const
 {
     const int written = client.printf(
@@ -210,6 +246,55 @@ bool SttClient::sendDatasetRequest(WiFiClient& client,
         if (!writeAll(client, pcmBytes + offset, chunkSize))
             return false;
     }
+    return writeAll(client, reinterpret_cast<const uint8_t*>(MULTIPART_SUFFIX), sizeof(MULTIPART_SUFFIX) - 1);
+}
+
+bool SttClient::sendCalibrationRequest(WiFiClient& client,
+                                       const int16_t* pcm16,
+                                       size_t pcmByteCount,
+                                       const CalibrationMetadata& metadata) const
+{
+    String prefix;
+    prefix.reserve(1800);
+    appendMultipartField(prefix, "mode", metadata.mode);
+    appendMultipartField(prefix, "distance_cm", String(metadata.distanceCm));
+    appendMultipartField(prefix, "sample_id", String(metadata.sampleId));
+    appendMultipartField(prefix, "voice_level", metadata.voiceLevel);
+    appendMultipartField(prefix, "fan_state", metadata.fanState);
+    appendMultipartField(prefix, "noise_rms", String(metadata.noiseRms));
+    appendMultipartField(prefix, "noise_peak_rms", String(metadata.noisePeakRms));
+    appendMultipartField(prefix, "raw24_rms", String(metadata.raw24Rms));
+    appendMultipartField(prefix, "pcm16_rms", String(metadata.pcm16Rms));
+    appendMultipartField(prefix, "peak_abs", String(metadata.peakAbsolute));
+    appendMultipartField(prefix, "clipping", String(metadata.clippingCount));
+    appendMultipartField(prefix, "vad_trigger_rms", String(metadata.vadTriggerRms));
+    appendMultipartField(prefix, "vad_trigger_delay_ms", String(metadata.vadTriggerDelayMs));
+    prefix += "------RockyBoundary\r\n"
+              "Content-Disposition: form-data; name=\"file\"; filename=\"calibration.wav\"\r\n"
+              "Content-Type: audio/wav\r\n\r\n";
+
+    const size_t contentLength = prefix.length() + WAV_HEADER_SIZE + pcmByteCount + sizeof(MULTIPART_SUFFIX) - 1;
+    if (client.printf("POST /calibration/audio HTTP/1.1\r\nHost: %s:%u\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+                      STT_SERVER_HOST, STT_SERVER_PORT, MULTIPART_BOUNDARY,
+                      static_cast<unsigned>(contentLength)) <= 0 ||
+        !writeAll(client, reinterpret_cast<const uint8_t*>(prefix.c_str()), prefix.length()))
+    {
+        return false;
+    }
+
+    uint8_t wavHeader[WAV_HEADER_SIZE]{};
+    createWavHeader(wavHeader, pcmByteCount);
+    if (!writeAll(client, wavHeader, sizeof(wavHeader)))
+        return false;
+
+    const uint8_t* const pcmBytes = reinterpret_cast<const uint8_t*>(pcm16);
+    for (size_t offset = 0; offset < pcmByteCount; offset += PCM_WRITE_CHUNK_BYTES)
+    {
+        const size_t chunkSize = min(PCM_WRITE_CHUNK_BYTES, pcmByteCount - offset);
+        if (!writeAll(client, pcmBytes + offset, chunkSize))
+            return false;
+    }
+
     return writeAll(client, reinterpret_cast<const uint8_t*>(MULTIPART_SUFFIX), sizeof(MULTIPART_SUFFIX) - 1);
 }
 

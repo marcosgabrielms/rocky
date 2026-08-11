@@ -1,4 +1,7 @@
 import io
+import csv
+import math
+import struct
 import time
 import wave
 from datetime import datetime
@@ -6,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from faster_whisper import WhisperModel
 
 
@@ -21,6 +24,7 @@ COMPUTE_TYPE = "int8"
 
 app = FastAPI()
 DATASET_DIRECTORY = Path(__file__).parent / "dataset"
+CALIBRATION_DIRECTORY = Path(__file__).parent / "calibration"
 COMMAND_WINDOW_SECONDS = 10.0
 COMMAND_WINDOW_MS = int(COMMAND_WINDOW_SECONDS * 1000)
 SAO_PAULO_TIMEZONE = ZoneInfo("America/Sao_Paulo")
@@ -101,6 +105,77 @@ async def save_dataset(file: UploadFile | None = File(default=None), label: str 
     return {"label": label, "index": index, "filename": destination.name}
 
 
+@app.post("/calibration/audio")
+async def save_calibration_audio(
+    file: UploadFile | None = File(default=None),
+    mode: str = Form(),
+    distance_cm: int = Form(),
+    sample_id: int = Form(),
+    voice_level: str = Form(default="normal"),
+    fan_state: str = Form(default="off"),
+    noise_rms: int = Form(default=0),
+    noise_peak_rms: int = Form(default=0),
+    raw24_rms: int = Form(default=0),
+    pcm16_rms: int = Form(default=0),
+    peak_abs: int = Form(default=0),
+    clipping: int = Form(default=0),
+    vad_trigger_rms: int = Form(default=0),
+    vad_trigger_delay_ms: int = Form(default=0),
+) -> dict[str, int | float | str]:
+    if file is None:
+        raise HTTPException(status_code=400, detail="Arquivo WAV ausente.")
+    if mode not in {"raw", "vad", "noise"}:
+        raise HTTPException(status_code=400, detail="Modo de calibracao invalido.")
+    if distance_cm not in {20, 40, 60, 80}:
+        raise HTTPException(status_code=400, detail="Distancia de calibracao invalida.")
+    if voice_level not in {"low", "normal", "high"}:
+        raise HTTPException(status_code=400, detail="Nivel de voz invalido.")
+    if fan_state not in {"on", "off"}:
+        raise HTTPException(status_code=400, detail="Estado do ventilador invalido.")
+    if sample_id == 0:
+        raise HTTPException(status_code=400, detail="Identificador da amostra invalido.")
+    if file.content_type != EXPECTED_CONTENT_TYPE:
+        raise HTTPException(status_code=415, detail="O arquivo deve ter o tipo audio/wav.")
+
+    audio_data = await file.read()
+    await file.close()
+    if not audio_data:
+        raise HTTPException(status_code=400, detail="Arquivo WAV vazio.")
+    if len(audio_data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Arquivo WAV excede o limite de 1 MB.")
+
+    duration_seconds = validate_wav(audio_data)
+    pcm_metrics = calculate_pcm16_metrics(audio_data)
+    destination = save_calibration_file(mode, distance_cm, voice_level, fan_state, sample_id, audio_data)
+    snr_estimate_db = calculate_snr_estimate(raw24_rms, noise_rms)
+    append_calibration_result({
+        "sample_id": sample_id,
+        "mode": mode,
+        "distance_cm": distance_cm,
+        "voice_level": voice_level,
+        "fan_state": fan_state,
+        "noise_rms": noise_rms,
+        "raw24_rms": raw24_rms,
+        "pcm16_rms": pcm16_rms,
+        "speech_rms": raw24_rms,
+        "peak_abs": peak_abs,
+        "snr_estimate_db": snr_estimate_db,
+        "vad_trigger_rms": vad_trigger_rms,
+        "vad_trigger_delay_ms": vad_trigger_delay_ms,
+        "duration_ms": round(duration_seconds * 1000),
+        "clipping": clipping,
+        "wav_file": destination.name,
+    })
+    print(f"[CAL] saved={destination.name}")
+    print(f"[CAL] pcm16_rms={pcm_metrics['rms']} peak_abs={pcm_metrics['peak_abs']}")
+    return {
+        "filename": destination.name,
+        "duration_ms": round(duration_seconds * 1000),
+        "pcm16_rms": pcm_metrics["rms"],
+        "peak_abs": pcm_metrics["peak_abs"],
+    }
+
+
 def save_unique_dataset_file(label: str, audio_data: bytes) -> Path:
     directory = DATASET_DIRECTORY / label
     directory.mkdir(parents=True, exist_ok=True)
@@ -113,6 +188,51 @@ def save_unique_dataset_file(label: str, audio_data: bytes) -> Path:
             return destination
         except FileExistsError:
             index += 1
+
+
+def save_calibration_file(
+    mode: str,
+    distance_cm: int,
+    voice_level: str,
+    fan_state: str,
+    sample_id: int,
+    audio_data: bytes,
+) -> Path:
+    CALIBRATION_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    if mode == "noise":
+        filename = f"noise_{distance_cm}cm_fan{fan_state}_{sample_id:03d}.wav"
+    else:
+        filename = f"{mode}_{distance_cm}cm_{voice_level}_fan{fan_state}_{sample_id:03d}.wav"
+    destination = CALIBRATION_DIRECTORY / filename
+    with destination.open("xb") as output_file:
+        output_file.write(audio_data)
+    return destination
+
+
+def calculate_pcm16_metrics(audio_data: bytes) -> dict[str, int]:
+    with wave.open(io.BytesIO(audio_data), "rb") as wav_file:
+        samples = tuple(sample[0] for sample in struct.iter_unpack("<h", wav_file.readframes(wav_file.getnframes())))
+
+    peak_absolute = max(abs(sample) for sample in samples)
+    rms = int(math.sqrt(sum(sample * sample for sample in samples) / len(samples)))
+    return {"rms": rms, "peak_abs": peak_absolute}
+
+
+def calculate_snr_estimate(speech_rms: int, noise_rms: int) -> float:
+    if speech_rms == 0 or noise_rms == 0:
+        return 0.0
+    return round(20.0 * math.log10(speech_rms / noise_rms), 1)
+
+
+def append_calibration_result(result: dict[str, int | float | str]) -> None:
+    CALIBRATION_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    destination = CALIBRATION_DIRECTORY / "results.csv"
+    write_header = not destination.exists()
+    with destination.open("a", newline="", encoding="utf-8") as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=result.keys())
+        if write_header:
+            writer.writeheader()
+        writer.writerow(result)
 
 
 def build_transcription_response(text: str, device_id: str) -> dict[str, object]:

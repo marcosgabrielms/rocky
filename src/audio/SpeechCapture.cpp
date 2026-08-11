@@ -20,6 +20,10 @@ bool SpeechCapture::begin()
     completed = false;
     limitReached = false;
     metrics = {};
+    raw24Metrics = {};
+    fixedDurationCapture = false;
+    captureSampleLimit = MAX_SAMPLES;
+    resetCaptureMetrics();
 
     return psramAllocated;
 }
@@ -40,12 +44,22 @@ void SpeechCapture::start()
     if (samples == nullptr || capturing)
         return;
 
-    sampleCount = 0;
-    segmentReady = false;
-    completed = false;
-    limitReached = false;
+    resetCaptureMetrics();
+    fixedDurationCapture = false;
+    captureSampleLimit = MAX_SAMPLES;
     capturing = true;
     copyPreBuffer();
+}
+
+void SpeechCapture::startFixedCapture(uint32_t durationMs)
+{
+    if (samples == nullptr || capturing)
+        return;
+
+    resetCaptureMetrics();
+    fixedDurationCapture = true;
+    captureSampleLimit = min(MAX_SAMPLES, static_cast<size_t>(SAMPLE_RATE * durationMs / 1000UL));
+    capturing = captureSampleLimit > 0;
 }
 
 void SpeechCapture::finish()
@@ -57,6 +71,7 @@ void SpeechCapture::finish()
     segmentReady = sampleCount > 0;
     completed = segmentReady;
     calculateMetrics();
+    calculateRaw24Metrics();
     preBufferCount = 0;
     preBufferWriteIndex = 0;
 }
@@ -108,6 +123,11 @@ const SpeechCapture::Pcm16Metrics& SpeechCapture::getMetrics() const
     return metrics;
 }
 
+const SpeechCapture::Raw24Metrics& SpeechCapture::getRaw24Metrics() const
+{
+    return raw24Metrics;
+}
+
 bool SpeechCapture::usesPsram() const
 {
     return psramAllocated;
@@ -126,19 +146,40 @@ void SpeechCapture::pushPreBufferSamples(const int32_t* input, size_t inputCount
 
 void SpeechCapture::appendSamples(const int32_t* input, size_t inputCount)
 {
-    const size_t remaining = MAX_SAMPLES - sampleCount;
+    const size_t remaining = captureSampleLimit - sampleCount;
     const size_t samplesToCopy = inputCount < remaining ? inputCount : remaining;
 
     for (size_t index = 0; index < samplesToCopy; ++index)
-        samples[sampleCount + index] = convertToPcm16(input[index]);
+        appendSample(input[index]);
 
-    sampleCount += samplesToCopy;
-
-    if (sampleCount == MAX_SAMPLES)
+    if (sampleCount == captureSampleLimit)
     {
-        limitReached = true;
+        limitReached = !fixedDurationCapture;
         finish();
     }
+}
+
+void SpeechCapture::appendSample(int32_t sample)
+{
+    samples[sampleCount] = convertToPcm16(sample);
+    raw24Sum += sample;
+    raw24SumOfSquares += static_cast<int64_t>(sample) * sample;
+    ++raw24SampleCount;
+
+    if (raw24SampleCount == 1)
+    {
+        raw24Metrics.minimum = sample;
+        raw24Metrics.maximum = sample;
+    }
+    else
+    {
+        raw24Metrics.minimum = min(raw24Metrics.minimum, sample);
+        raw24Metrics.maximum = max(raw24Metrics.maximum, sample);
+    }
+
+    const int64_t absolute = sample < 0 ? -static_cast<int64_t>(sample) : sample;
+    raw24Metrics.peakAbsolute = max(raw24Metrics.peakAbsolute, static_cast<int32_t>(absolute));
+    ++sampleCount;
 }
 
 void SpeechCapture::copyPreBuffer()
@@ -147,9 +188,8 @@ void SpeechCapture::copyPreBuffer()
                               PRE_BUFFER_SAMPLES;
 
     for (size_t index = 0; index < preBufferCount; ++index)
-        samples[index] = convertToPcm16(preBuffer[(firstIndex + index) % PRE_BUFFER_SAMPLES]);
+        appendSample(preBuffer[(firstIndex + index) % PRE_BUFFER_SAMPLES]);
 
-    sampleCount = preBufferCount;
 }
 
 void SpeechCapture::calculateMetrics()
@@ -179,11 +219,37 @@ void SpeechCapture::calculateMetrics()
         {
             ++metrics.clippingCount;
         }
+
+        const int32_t absolute = sample < 0 ? -static_cast<int32_t>(sample) : sample;
+        metrics.peakAbsolute = max(metrics.peakAbsolute, absolute);
     }
 
     metrics.mean = static_cast<int32_t>(sum / static_cast<int64_t>(sampleCount));
     metrics.rms = static_cast<uint32_t>(std::sqrt(
         static_cast<double>(sumOfSquares) / sampleCount));
+}
+
+void SpeechCapture::calculateRaw24Metrics()
+{
+    if (raw24SampleCount == 0)
+        return;
+
+    raw24Metrics.mean = static_cast<int32_t>(raw24Sum / static_cast<int64_t>(raw24SampleCount));
+    raw24Metrics.rms = static_cast<uint32_t>(std::sqrt(
+        static_cast<double>(raw24SumOfSquares) / raw24SampleCount));
+}
+
+void SpeechCapture::resetCaptureMetrics()
+{
+    sampleCount = 0;
+    segmentReady = false;
+    completed = false;
+    limitReached = false;
+    metrics = {};
+    raw24Metrics = {};
+    raw24Sum = 0;
+    raw24SumOfSquares = 0;
+    raw24SampleCount = 0;
 }
 
 int16_t SpeechCapture::convertToPcm16(int32_t sample)

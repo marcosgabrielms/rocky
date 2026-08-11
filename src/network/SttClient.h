@@ -6,6 +6,23 @@
 class SttClient
 {
 public:
+    struct CalibrationMetadata
+    {
+        const char* mode = "vad";
+        const char* voiceLevel = "normal";
+        const char* fanState = "off";
+        uint32_t distanceCm = 0;
+        uint32_t sampleId = 0;
+        uint32_t noiseRms = 0;
+        uint32_t noisePeakRms = 0;
+        uint32_t raw24Rms = 0;
+        uint32_t pcm16Rms = 0;
+        int32_t peakAbsolute = 0;
+        size_t clippingCount = 0;
+        uint32_t vadTriggerRms = 0;
+        uint32_t vadTriggerDelayMs = 0;
+    };
+
     struct BackendAction
     {
         enum class Type : uint8_t { None, Expression, ShowText };
@@ -28,6 +45,10 @@ public:
     bool checkHealth();
     bool transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendResponse& response);
     bool uploadDataset(const int16_t* pcm16, size_t pcmByteCount, const char* label, uint32_t& index);
+    bool uploadCalibration(const int16_t* pcm16,
+                           size_t pcmByteCount,
+                           const CalibrationMetadata& metadata,
+                           String& filename);
 
 private:
     static constexpr uint32_t HTTP_TIMEOUT_MS = 15000;
@@ -40,6 +61,10 @@ private:
                             const int16_t* pcm16,
                             size_t pcmByteCount,
                             const char* label) const;
+    bool sendCalibrationRequest(WiFiClient& client,
+                                const int16_t* pcm16,
+                                size_t pcmByteCount,
+                                const CalibrationMetadata& metadata) const;
     static bool writeAll(WiFiClient& client, const uint8_t* data, size_t dataSize);
     static int readStatusCode(WiFiClient& client);
     static String readResponseBody(WiFiClient& client);

@@ -33,7 +33,7 @@ public:
     void lookCenter();
     void setGazeOffset(int16_t x, int16_t y);
     void setBlinking(bool blinking);
-    void setVisualState(VisualState state);
+    void setVisualState(VisualState state, bool showConfirmation = true);
     void setMood(Mood mood);
     bool isAttentionConfirming() const;
 

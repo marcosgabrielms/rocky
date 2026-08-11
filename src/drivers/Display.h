@@ -26,6 +26,10 @@ public:
 
     void drawLine(int16_t x1, int16_t y1, int16_t x2, int16_t y2);
 
+    void showAttentionPrompt(uint32_t secondsRemaining);
+
+    void showTime(const String& time);
+
 private:
 
     static constexpr uint8_t WIDTH = 128;

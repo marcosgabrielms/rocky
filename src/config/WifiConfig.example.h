@@ -1,4 +1,7 @@
 #pragma once
 
+#define STT_SERVER_HOST "192.168.15.161"
+#define STT_SERVER_PORT 8000
+
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"

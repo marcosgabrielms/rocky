@@ -57,3 +57,6 @@ dist/
 # Credenciais locais
 # -------------------------------
 src/config/WifiConfig.h
+server/.env
+server/.venv/
+server/dataset/

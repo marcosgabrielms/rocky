@@ -4,9 +4,14 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence, runtime_checkable
 
 
+class LLMError(Exception):
+    """Erro controlado ao solicitar ou interpretar uma resposta de LLM."""
+
+
 @dataclass(frozen=True)
 class LLMResult:
     text: str
+    model: str | None = None
 
 
 @runtime_checkable

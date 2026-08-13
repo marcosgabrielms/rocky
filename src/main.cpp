@@ -561,7 +561,7 @@ void handleBackendResponse(const SttClient::BackendResponse& response)
         }
         setVisualState(Eyes::VisualState::Attention, false);
     }
-    else if (response.interactionState == "idle" && !voiceActivityDetector.isSpeaking())
+    else if (response.interactionState == "idle")
     {
         interactionState = InteractionState::Idle;
         backendConversationActive = false;

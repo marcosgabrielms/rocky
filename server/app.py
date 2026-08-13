@@ -3,6 +3,7 @@
 import csv
 import io
 import math
+import os
 import struct
 import wave
 from pathlib import Path
@@ -10,17 +11,20 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
 from services.conversation import ConversationManager
+from services.llm import OpenRouterLLMClient
 from services.stt import SAMPLE_RATE, transcribe as transcribe_audio, validate_wav
 
 
 MAX_UPLOAD_BYTES = 1024 * 1024
 EXPECTED_CONTENT_TYPE = "audio/wav"
 COMMAND_WINDOW_MS = 10000
+DEFAULT_CONVERSATION_LLM_MODEL = "openai/gpt-oss-20b:free"
 DATASET_DIRECTORY = Path(__file__).parent / "dataset"
 CALIBRATION_DIRECTORY = Path(__file__).parent / "calibration"
 
 app = FastAPI()
-conversation_manager = ConversationManager(COMMAND_WINDOW_MS)
+llm_client = OpenRouterLLMClient(model=os.getenv("OPENROUTER_MODEL", DEFAULT_CONVERSATION_LLM_MODEL))
+conversation_manager = ConversationManager(COMMAND_WINDOW_MS, llm_client)
 
 
 @app.get("/health")

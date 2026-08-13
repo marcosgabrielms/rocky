@@ -51,7 +51,7 @@ public:
                            String& filename);
 
 private:
-    static constexpr uint32_t HTTP_TIMEOUT_MS = 15000;
+    static constexpr uint32_t HTTP_TIMEOUT_MS = 60000;
 
     bool sendGetRequest(WiFiClient& client) const;
     bool sendMultipartRequest(WiFiClient& client,

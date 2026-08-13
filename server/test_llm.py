@@ -1,11 +1,20 @@
 """Teste manual do fluxo OpenRouter integrado à conversa do Rocky."""
 
+import sys
+
 from services.conversation import ConversationManager
 from services.llm import LLMResult, OpenRouterLLMClient
 
 
 QUESTION = "Responda em português: por que o céu é azul?"
 DEVICE_ID = "manual-openrouter-test"
+PERSONALITY_QUESTIONS = (
+    "Quanto é 2 + 2?",
+    "Por que o céu é azul?",
+    "Você é inteligente?",
+    "Explique com mais detalhes por que o céu é azul.",
+    "Quanto é 10% de 200?",
+)
 
 
 class CountingLLMClient:
@@ -50,6 +59,16 @@ def main() -> None:
     assert hours["actions"][0]["line1"] == "Agora sao"
     assert llm_client.calls == 1
     print("[TEST] hours_llm_called=no")
+
+    if "--personality" in sys.argv:
+        print("[TEST] personality responses")
+        for question in PERSONALITY_QUESTIONS:
+            result = llm_client.ask(question)
+            print(f"Pergunta: {question}")
+            print(f"Resposta: {result.text}")
+            if result.model:
+                print(f"Modelo: {result.model}")
+
     print("[TEST] integration=OK")
 
 

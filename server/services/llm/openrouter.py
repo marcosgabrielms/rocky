@@ -9,11 +9,13 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from services.llm.base import LLMError, LLMResult
+from services.llm.personality import ROCKY_SYSTEM_PROMPT
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "openrouter/free"
 REQUEST_TIMEOUT_SECONDS = 20
+MAX_RESPONSE_TOKENS = 160
 
 
 class OpenRouterLLMClient:
@@ -28,6 +30,7 @@ class OpenRouterLLMClient:
         payload = {
             "model": self._model,
             "messages": self._build_messages(message, context),
+            "max_tokens": MAX_RESPONSE_TOKENS,
         }
         request = Request(
             OPENROUTER_URL,
@@ -63,7 +66,8 @@ class OpenRouterLLMClient:
 
     @staticmethod
     def _build_messages(message: str, context: Sequence[str] | None) -> list[dict[str, str]]:
-        messages = [{"role": "user", "content": item} for item in context or ()]
+        messages = [{"role": "system", "content": ROCKY_SYSTEM_PROMPT}]
+        messages.extend({"role": "user", "content": item} for item in context or ())
         messages.append({"role": "user", "content": message})
         return messages
 

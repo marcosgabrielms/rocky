@@ -485,7 +485,10 @@ void sendCompletedSpeech()
     }
 
     if (!sttServerAvailable)
+    {
+        returnToIdle();
         return;
+    }
 
     reportCaptureMemory("before_stt");
     const uint32_t requestStartedAt = millis();
@@ -502,8 +505,7 @@ void sendCompletedSpeech()
     else
     {
         Serial.println("[BACKEND] invalid response");
-        if (interactionState == InteractionState::ProcessingCommand)
-            returnToIdle();
+        returnToIdle();
     }
 
     reportCaptureMemory("after_stt");
@@ -692,12 +694,24 @@ void setVisualState(Eyes::VisualState state, bool showConfirmation)
     if (currentVisualState == state)
         return;
 
-    const char* const previous = currentVisualState == Eyes::VisualState::Idle
-                                     ? "IDLE"
-                                     : currentVisualState == Eyes::VisualState::Attention ? "ATTENTION" : "LISTENING";
-    const char* const next = state == Eyes::VisualState::Idle
-                                 ? "IDLE"
-                                 : state == Eyes::VisualState::Attention ? "ATTENTION" : "LISTENING";
+    const auto stateName = [](Eyes::VisualState visualState) -> const char*
+    {
+        switch (visualState)
+        {
+        case Eyes::VisualState::Idle:
+            return "IDLE";
+        case Eyes::VisualState::Attention:
+            return "ATTENTION";
+        case Eyes::VisualState::Listening:
+            return "LISTENING";
+        case Eyes::VisualState::Thinking:
+            return "THINKING";
+        }
+
+        return "UNKNOWN";
+    };
+    const char* const previous = stateName(currentVisualState);
+    const char* const next = stateName(state);
     currentVisualState = state;
     animator.setVisualState(state, showConfirmation);
     Serial.printf("[STATE] %s -> %s\n", previous, next);
@@ -767,10 +781,6 @@ void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
             if (diagnosticCaptureMode != DiagnosticCaptureMode::Vad || !diagnosticVadArmed)
                 return;
         }
-        else if (interactionState == InteractionState::ProcessingCommand)
-            setVisualState(Eyes::VisualState::Attention, false);
-        else
-            setVisualState(Eyes::VisualState::Idle);
     }
 
     if constexpr (MIC_DIAGNOSTIC_MODE)
@@ -781,7 +791,10 @@ void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
         if constexpr (MIC_DIAGNOSTIC_MODE)
             reportDiagnosticCapture();
         else
+        {
+            setVisualState(Eyes::VisualState::Thinking, false);
             sendCompletedSpeech();
+        }
     }
 }
 

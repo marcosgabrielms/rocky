@@ -48,6 +48,13 @@ void Eyes::update(uint32_t now)
     redrawRequested = false;
 }
 
+void Eyes::render()
+{
+    draw();
+    lastDraw = millis();
+    redrawRequested = false;
+}
+
 void Eyes::lookLeft()
 {
     setGaze(-MAX_GAZE_X, 0);
@@ -134,7 +141,8 @@ void Eyes::draw() const
     }
 
     const bool isListening = visualState == VisualState::Listening;
-    const int16_t width = isListening ? LISTENING_EYE_SIZE : EYE_WIDTH;
+    const bool isThinking = visualState == VisualState::Thinking;
+    const int16_t width = isListening ? LISTENING_EYE_SIZE : isThinking ? THINKING_EYE_WIDTH : EYE_WIDTH;
     const int16_t baseHeight = baseEyeHeight();
     const int16_t height = std::max(
         MIN_EYE_HEIGHT,
@@ -142,7 +150,7 @@ void Eyes::draw() const
     const int16_t y = EYE_CENTER_Y + static_cast<int16_t>(std::lround(gazeY)) - height / 2;
     const int16_t leftX = LEFT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - width / 2;
     const int16_t rightX = RIGHT_EYE_CENTER_X + static_cast<int16_t>(std::lround(gazeX)) - width / 2;
-    const int16_t radius = isListening ? LISTENING_EYE_RADIUS : cornerRadius(height);
+    const int16_t radius = isListening ? LISTENING_EYE_RADIUS : isThinking ? 2 : cornerRadius(height);
 
     display.clear();
     display.fillRoundRect(leftX, y, width, height, radius);
@@ -172,6 +180,9 @@ int16_t Eyes::baseEyeHeight() const
 {
     if (visualState == VisualState::Listening)
         return LISTENING_EYE_SIZE;
+
+    if (visualState == VisualState::Thinking)
+        return THINKING_EYE_HEIGHT;
 
     if (visualState == VisualState::Attention)
         return ATTENTION_EYE_HEIGHT;

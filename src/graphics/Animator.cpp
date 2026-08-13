@@ -30,7 +30,8 @@ void Animator::setVisualState(Eyes::VisualState newState, bool showConfirmation)
     eyes.setVisualState(newState, showConfirmation);
 
     if (visualState == Eyes::VisualState::Attention ||
-        visualState == Eyes::VisualState::Listening)
+        visualState == Eyes::VisualState::Listening ||
+        visualState == Eyes::VisualState::Thinking)
     {
         eyes.lookCenter();
 
@@ -39,6 +40,7 @@ void Animator::setVisualState(Eyes::VisualState newState, bool showConfirmation)
     }
 
     lastGazeChangeAt = millis();
+    eyes.render();
 }
 
 void Animator::updateBlink(uint32_t now)

@@ -11,7 +11,8 @@ public:
     {
         Idle,
         Attention,
-        Listening
+        Listening,
+        Thinking
     };
 
     enum class Mood : uint8_t
@@ -25,6 +26,7 @@ public:
 
     void begin(uint32_t now);
     void update(uint32_t now);
+    void render();
 
     void lookLeft();
     void lookRight();
@@ -45,6 +47,8 @@ private:
     static constexpr int16_t EYE_HEIGHT = 42;
     static constexpr int16_t ATTENTION_EYE_HEIGHT = 44;
     static constexpr int16_t LISTENING_EYE_HEIGHT = 28;
+    static constexpr int16_t THINKING_EYE_WIDTH = 28;
+    static constexpr int16_t THINKING_EYE_HEIGHT = 10;
     static constexpr int16_t MIN_EYE_HEIGHT = 3;
     static constexpr int16_t MAX_GAZE_X = 7;
     static constexpr int16_t MAX_GAZE_Y = 5;

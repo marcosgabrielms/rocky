@@ -38,6 +38,7 @@ constexpr uint32_t TIME_SCREEN_DURATION_MS = 3000;
 constexpr uint32_t COMMAND_WINDOW_DURATION_MS = 6000;
 constexpr bool SERIAL_VERBOSE_AUDIO = false;
 constexpr bool MIC_DIAGNOSTIC_MODE = false;
+constexpr bool VAD_TRIGGER_DIAGNOSTICS = false;
 constexpr uint32_t MIC_FRAME_DURATION_MS = MIC_BLOCK_SAMPLES * 1000UL / SpeechCapture::SAMPLE_RATE;
 constexpr uint32_t NOISE_WINDOW_MS = 750;
 constexpr size_t NOISE_WINDOW_FRAMES = NOISE_WINDOW_MS / MIC_FRAME_DURATION_MS;
@@ -744,6 +745,9 @@ void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
 
     if (voiceActivityDetector.didSpeechStart())
     {
+        if constexpr (VAD_TRIGGER_DIAGNOSTICS)
+            Serial.printf("[VAD DIAG] trigger_raw24_rms=%.0f\n", rms);
+
         if constexpr (MIC_DIAGNOSTIC_MODE)
         {
             if (diagnosticCaptureMode != DiagnosticCaptureMode::Vad || !diagnosticVadArmed)

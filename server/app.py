@@ -13,6 +13,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from services.conversation import ConversationManager
 from services.llm import OpenRouterLLMClient
 from services.stt import SAMPLE_RATE, transcribe as transcribe_audio, validate_wav
+from services.tts import LocalResponseSpeaker, PiperTTS
 
 
 MAX_UPLOAD_BYTES = 1024 * 1024
@@ -21,10 +22,14 @@ COMMAND_WINDOW_MS = 10000
 DEFAULT_CONVERSATION_LLM_MODEL = "openai/gpt-oss-20b:free"
 DATASET_DIRECTORY = Path(__file__).parent / "dataset"
 CALIBRATION_DIRECTORY = Path(__file__).parent / "calibration"
+TTS_DIRECTORY = Path(__file__).parent / "local" / "tts"
+TTS_MODEL_PATH = TTS_DIRECTORY / "voices" / "pt_BR-jeff-medium.onnx"
+TTS_OUTPUT_PATH = TTS_DIRECTORY / "rocky_response.wav"
 
 app = FastAPI()
 llm_client = OpenRouterLLMClient(model=os.getenv("OPENROUTER_MODEL", DEFAULT_CONVERSATION_LLM_MODEL))
 conversation_manager = ConversationManager(COMMAND_WINDOW_MS, llm_client)
+response_speaker = LocalResponseSpeaker(PiperTTS(TTS_MODEL_PATH), TTS_OUTPUT_PATH)
 
 
 @app.get("/health")
@@ -46,7 +51,9 @@ async def transcribe(
     print(f"[STT] mode={'wake' if use_wake_hotword else 'command'}")
     text = transcribe_audio(audio_data, file.filename, use_wake_hotword)
     print("[STT] transcription completed")
-    return conversation_manager.build_response(text, x_rocky_device)
+    response = conversation_manager.build_response(text, x_rocky_device)
+    response_speaker.speak_response(response, text)
+    return response
 
 
 @app.post("/dataset")

@@ -7,6 +7,14 @@ from services.commands import detect_command_intent, get_current_time, normalize
 from services.llm import LLMClient, LLMError
 
 
+WAKE_PHRASES = frozenset({"ok rocky", "rocky"})
+
+
+def is_wake_phrase(text: str) -> bool:
+    normalized = "".join(character if character.isalnum() else " " for character in text.casefold())
+    return " ".join(normalized.split()) in WAKE_PHRASES
+
+
 class ConversationManager:
     def __init__(self, command_window_ms: int, llm_client: LLMClient) -> None:
         self._command_window_seconds = command_window_ms / 1000
@@ -21,7 +29,7 @@ class ConversationManager:
     def build_response(self, text: str, device_id: str) -> BackendResponse:
         normalized = normalize_text(text)
         now = time.monotonic()
-        if normalized == "rocky":
+        if is_wake_phrase(text):
             self._deadlines[device_id] = now + self._command_window_seconds
             print("[CONVERSATION] wake matched")
             print("[CONVERSATION] state=waiting_command")

@@ -8,7 +8,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from services.llm.base import LLMError, LLMResult
+from services.llm.base import ConversationMessage, LLMError, LLMResult
 from services.llm.personality import ROCKY_SYSTEM_PROMPT
 
 
@@ -23,7 +23,7 @@ class OpenRouterLLMClient:
         self._api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
         self._model = model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
 
-    def ask(self, message: str, context: Sequence[str] | None = None) -> LLMResult:
+    def ask(self, message: str, context: Sequence[ConversationMessage] | None = None) -> LLMResult:
         if not self._api_key:
             raise LLMError("OPENROUTER_API_KEY is not configured")
 
@@ -65,9 +65,11 @@ class OpenRouterLLMClient:
         return result
 
     @staticmethod
-    def _build_messages(message: str, context: Sequence[str] | None) -> list[dict[str, str]]:
+    def _build_messages(
+        message: str, context: Sequence[ConversationMessage] | None
+    ) -> list[dict[str, str]]:
         messages = [{"role": "system", "content": ROCKY_SYSTEM_PROMPT}]
-        messages.extend({"role": "user", "content": item} for item in context or ())
+        messages.extend({"role": item.role, "content": item.content} for item in context or ())
         messages.append({"role": "user", "content": message})
         return messages
 

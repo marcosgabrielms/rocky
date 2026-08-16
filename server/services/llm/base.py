@@ -1,7 +1,7 @@
 """Interface independente de fornecedor para modelos de linguagem."""
 
 from dataclasses import dataclass
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Literal, Protocol, Sequence, runtime_checkable
 
 
 class LLMError(Exception):
@@ -14,7 +14,13 @@ class LLMResult:
     model: str | None = None
 
 
+@dataclass(frozen=True)
+class ConversationMessage:
+    role: Literal["user", "assistant"]
+    content: str
+
+
 @runtime_checkable
 class LLMClient(Protocol):
-    def ask(self, message: str, context: Sequence[str] | None = None) -> LLMResult:
+    def ask(self, message: str, context: Sequence[ConversationMessage] | None = None) -> LLMResult:
         """Retorna uma resposta textual para uma mensagem do usuário."""

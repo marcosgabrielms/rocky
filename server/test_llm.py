@@ -1,9 +1,10 @@
 """Teste manual do fluxo OpenRouter integrado à conversa do Rocky."""
 
 import sys
+from collections.abc import Sequence
 
 from services.conversation import ConversationManager
-from services.llm import LLMResult, OpenRouterLLMClient
+from services.llm import ConversationMessage, LLMResult, OpenRouterLLMClient
 
 
 QUESTION = "Responda em português: por que o céu é azul?"
@@ -22,7 +23,7 @@ class CountingLLMClient:
         self._client = client
         self.calls = 0
 
-    def ask(self, message: str, context: list[str] | None = None) -> LLMResult:
+    def ask(self, message: str, context: Sequence[ConversationMessage] | None = None) -> LLMResult:
         self.calls += 1
         return self._client.ask(message, context)
 

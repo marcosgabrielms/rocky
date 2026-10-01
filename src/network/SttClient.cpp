@@ -1,8 +1,10 @@
 #include "SttClient.h"
 
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 
 #include "config/WifiConfig.h"
+#include "drivers/Speaker.h"
 
 namespace
 {
@@ -19,6 +21,24 @@ constexpr uint16_t PCM_CHANNELS = 1;
 constexpr uint16_t PCM_BITS_PER_SAMPLE = 16;
 constexpr uint32_t PCM_SAMPLE_RATE = 16000;
 constexpr char DEVICE_ID[] = "rocky-01";
+constexpr char RESPONSE_AUDIO_PATH[] = "/audio/rocky_response.wav";
+constexpr size_t RESPONSE_AUDIO_BLOCK_BYTES = 4096;
+constexpr size_t MAX_RESPONSE_AUDIO_BYTES = 1024 * 1024;
+constexpr uint32_t RESPONSE_AUDIO_SAMPLE_RATE = 32000;
+
+uint16_t readLittleEndian16(const uint8_t* source)
+{
+    return static_cast<uint16_t>(source[0]) |
+           (static_cast<uint16_t>(source[1]) << 8);
+}
+
+uint32_t readLittleEndian32(const uint8_t* source)
+{
+    return static_cast<uint32_t>(source[0]) |
+           (static_cast<uint32_t>(source[1]) << 8) |
+           (static_cast<uint32_t>(source[2]) << 16) |
+           (static_cast<uint32_t>(source[3]) << 24);
+}
 
 void writeLittleEndian16(uint8_t* destination, uint16_t value)
 {
@@ -114,6 +134,121 @@ bool SttClient::transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendRes
     }
 
     Serial.println("[STT] HTTP 200");
+    return true;
+}
+
+bool SttClient::playResponseAudio(Speaker& speaker)
+{
+    WiFiClient client;
+    client.setTimeout(HTTP_TIMEOUT_MS);
+    Serial.println("[AUDIO] download start");
+
+    if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) ||
+        client.printf("GET %s HTTP/1.1\r\nHost: %s:%u\r\nConnection: close\r\n\r\n",
+                      RESPONSE_AUDIO_PATH,
+                      STT_SERVER_HOST,
+                      STT_SERVER_PORT) <= 0)
+    {
+        Serial.println("[AUDIO] download failed");
+        client.stop();
+        return false;
+    }
+
+    size_t wavSize = 0;
+    if (readResponseHeaders(client, wavSize) != 200 || wavSize == 0 || wavSize > MAX_RESPONSE_AUDIO_BYTES)
+    {
+        Serial.println("[AUDIO] download failed");
+        client.stop();
+        return false;
+    }
+
+    uint8_t* const wavData = static_cast<uint8_t*>(heap_caps_malloc(wavSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (wavData == nullptr)
+    {
+        Serial.println("[AUDIO] download failed");
+        client.stop();
+        return false;
+    }
+
+    size_t receivedBytes = 0;
+    uint32_t downloadChunks = 0;
+    uint32_t shortReads = 0;
+    while (receivedBytes < wavSize)
+    {
+        const size_t requestedBytes = min(RESPONSE_AUDIO_BLOCK_BYTES, wavSize - receivedBytes);
+        const size_t chunkBytes = client.readBytes(reinterpret_cast<char*>(wavData + receivedBytes), requestedBytes);
+        if (chunkBytes == 0)
+            break;
+
+        if (chunkBytes < requestedBytes)
+            ++shortReads;
+        ++downloadChunks;
+        receivedBytes += chunkBytes;
+    }
+    client.stop();
+
+    if (receivedBytes != wavSize)
+    {
+        heap_caps_free(wavData);
+        Serial.println("[AUDIO] download failed");
+        return false;
+    }
+
+    WavInfo wavInfo;
+    if (!parseWav(wavData, wavSize, wavInfo) || wavInfo.sampleRate != RESPONSE_AUDIO_SAMPLE_RATE ||
+        wavInfo.bitsPerSample != 16 || wavInfo.channels != 1 || wavInfo.pcmByteCount == 0 ||
+        wavInfo.pcmByteCount % sizeof(int16_t) != 0)
+    {
+        heap_caps_free(wavData);
+        Serial.println("[AUDIO] unsupported wav");
+        return false;
+    }
+
+    Serial.printf("[AUDIO] wav rate=%lu bits=%u channels=%u\n",
+                  static_cast<unsigned long>(wavInfo.sampleRate),
+                  static_cast<unsigned>(wavInfo.bitsPerSample),
+                  static_cast<unsigned>(wavInfo.channels));
+    if (!speaker.beginPcmPlayback(wavInfo.sampleRate, wavInfo.bitsPerSample, wavInfo.channels))
+    {
+        heap_caps_free(wavData);
+        Serial.println("[AUDIO] playback failed");
+        return false;
+    }
+
+    const uint32_t expectedMs = static_cast<uint32_t>(wavInfo.pcmByteCount * 1000UL /
+                                                      (wavInfo.sampleRate * wavInfo.channels * sizeof(int16_t)));
+    const uint32_t playbackStartedAt = millis();
+    size_t playedBytes = 0;
+    uint32_t playbackChunks = 0;
+    uint32_t writeFailures = 0;
+    while (playedBytes < wavInfo.pcmByteCount)
+    {
+        const size_t chunkBytes = min(RESPONSE_AUDIO_BLOCK_BYTES, wavInfo.pcmByteCount - playedBytes);
+        const int16_t* const samples = reinterpret_cast<const int16_t*>(wavInfo.pcmData + playedBytes);
+        if (!speaker.playMonoPcm(samples, chunkBytes / sizeof(int16_t)))
+        {
+            ++writeFailures;
+            speaker.stop();
+            heap_caps_free(wavData);
+            Serial.println("[AUDIO] playback failed");
+            return false;
+        }
+
+        ++playbackChunks;
+        playedBytes += chunkBytes;
+    }
+
+    speaker.stop();
+    const uint32_t playbackMs = millis() - playbackStartedAt;
+    heap_caps_free(wavData);
+    Serial.printf("[AUDIO] expected_ms=%lu playback_ms=%lu chunks=%lu short_reads=%lu write_failures=%lu\n",
+                  static_cast<unsigned long>(expectedMs),
+                  static_cast<unsigned long>(playbackMs),
+                  static_cast<unsigned long>(playbackChunks),
+                  static_cast<unsigned long>(shortReads),
+                  static_cast<unsigned long>(writeFailures));
+    Serial.printf("[AUDIO] download_chunks=%lu\n", static_cast<unsigned long>(downloadChunks));
+    Serial.println("[AUDIO] playback end");
     return true;
 }
 
@@ -344,6 +479,47 @@ int SttClient::readStatusCode(WiFiClient& client)
     return 0;
 }
 
+int SttClient::readResponseHeaders(WiFiClient& client, size_t& contentLength)
+{
+    contentLength = 0;
+    const uint32_t startedAt = millis();
+    while (!client.available())
+    {
+        if (millis() - startedAt >= HTTP_TIMEOUT_MS)
+            return 0;
+
+        yield();
+    }
+
+    const String statusLine = client.readStringUntil('\n');
+    if (!statusLine.startsWith("HTTP/"))
+        return 0;
+
+    while (millis() - startedAt < HTTP_TIMEOUT_MS)
+    {
+        if (!client.available())
+        {
+            yield();
+            continue;
+        }
+
+        const String header = client.readStringUntil('\n');
+        if (header == "\r" || header.isEmpty())
+            return statusLine.substring(9, 12).toInt();
+
+        const int separatorPosition = header.indexOf(':');
+        if (separatorPosition < 0)
+            continue;
+
+        String name = header.substring(0, separatorPosition);
+        name.toLowerCase();
+        if (name == "content-length")
+            contentLength = static_cast<size_t>(header.substring(separatorPosition + 1).toInt());
+    }
+
+    return 0;
+}
+
 String SttClient::readResponseBody(WiFiClient& client)
 {
     String body;
@@ -369,6 +545,53 @@ String SttClient::readResponseBody(WiFiClient& client)
     return body;
 }
 
+bool SttClient::parseWav(const uint8_t* wavData, size_t wavSize, WavInfo& wavInfo)
+{
+    wavInfo = {};
+    if (wavData == nullptr || wavSize < 12 || memcmp(wavData, "RIFF", 4) != 0 ||
+        memcmp(wavData + 8, "WAVE", 4) != 0)
+        return false;
+
+    bool formatFound = false;
+    bool dataFound = false;
+    size_t offset = 12;
+    while (offset + 8 <= wavSize)
+    {
+        const uint8_t* const chunkId = wavData + offset;
+        const size_t chunkSize = readLittleEndian32(wavData + offset + 4);
+        const size_t chunkDataOffset = offset + 8;
+        if (chunkSize > wavSize - chunkDataOffset)
+            return false;
+
+        if (memcmp(chunkId, "fmt ", 4) == 0)
+        {
+            if (chunkSize < 16 || readLittleEndian16(wavData + chunkDataOffset) != 1)
+                return false;
+
+            wavInfo.channels = readLittleEndian16(wavData + chunkDataOffset + 2);
+            wavInfo.sampleRate = readLittleEndian32(wavData + chunkDataOffset + 4);
+            wavInfo.bitsPerSample = readLittleEndian16(wavData + chunkDataOffset + 14);
+            formatFound = true;
+        }
+        else if (memcmp(chunkId, "data", 4) == 0)
+        {
+            wavInfo.pcmData = wavData + chunkDataOffset;
+            wavInfo.pcmByteCount = chunkSize;
+            dataFound = true;
+        }
+
+        offset = chunkDataOffset + chunkSize;
+        if (chunkSize % 2 != 0)
+        {
+            if (offset == wavSize)
+                return false;
+            ++offset;
+        }
+    }
+
+    return formatFound && dataFound;
+}
+
 bool SttClient::extractText(const String& json, String& text)
 {
     return extractJsonString(json, "text", text);
@@ -381,6 +604,7 @@ bool SttClient::extractBackendResponse(const String& json, BackendResponse& resp
         return false;
 
     extractJsonUnsigned(json, "command_window_ms", response.commandWindowMs);
+    extractJsonBoolean(json, "audio_available", response.audioAvailable);
 
     const int actionsPosition = json.indexOf("\"actions\"");
     const int actionStart = json.indexOf('{', actionsPosition);
@@ -467,6 +691,28 @@ bool SttClient::extractJsonUnsigned(const String& json, const char* key, uint32_
 
     value = static_cast<uint32_t>(json.substring(separatorPosition + 1).toInt());
     return true;
+}
+
+bool SttClient::extractJsonBoolean(const String& json, const char* key, bool& value)
+{
+    const String quotedKey = String('"') + key + '"';
+    const int keyPosition = json.indexOf(quotedKey);
+    const int separatorPosition = json.indexOf(':', keyPosition + quotedKey.length());
+    if (keyPosition < 0 || separatorPosition < 0)
+        return false;
+
+    const String valueText = json.substring(separatorPosition + 1);
+    if (valueText.startsWith("true"))
+    {
+        value = true;
+        return true;
+    }
+    if (valueText.startsWith("false"))
+    {
+        value = false;
+        return true;
+    }
+    return false;
 }
 
 void SttClient::createWavHeader(uint8_t (&header)[44], size_t pcmByteCount)

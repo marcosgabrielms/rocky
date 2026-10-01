@@ -1,7 +1,9 @@
 """Testes determinísticos da decisão de fala local do Rocky."""
 
 import unittest
+import wave
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from models.actions import BackendResponse, expression, show_text
@@ -14,6 +16,11 @@ class FakeTTSClient:
 
     def synthesize_to_wav(self, text: str, output_path: Path) -> None:
         self.calls.append((text, output_path))
+        with wave.open(str(output_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(22050)
+            wav_file.writeframes(b"\x00\x00" * 22050)
 
 
 class FailingTTSClient:
@@ -23,18 +30,23 @@ class FailingTTSClient:
 
 class ResponseSpeakerTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.output_path = Path("rocky_response.wav")
+        self._temporary_directory = TemporaryDirectory()
+        self.output_path = Path(self._temporary_directory.name) / "rocky_response.wav"
         self.tts_client = FakeTTSClient()
-        self.speaker = LocalResponseSpeaker(self.tts_client, self.output_path)
+        self.speaker = LocalResponseSpeaker(self.tts_client, self.output_path, enable_local_playback=False)
+
+    def tearDown(self) -> None:
+        self._temporary_directory.cleanup()
 
     def test_llm_response_is_synthesized(self) -> None:
         response: BackendResponse = {"text": "Olá. Como posso ajudar?", "interaction_state": "idle", "actions": []}
 
-        with self._without_playback():
-            spoken = self.speaker.speak_response(response, "Qual é a sua função?")
+        spoken = self.speaker.speak_response(response, "Qual é a sua função?")
 
         self.assertTrue(spoken)
         self.assertEqual(self.tts_client.calls, [("Olá. Como posso ajudar?", self.output_path)])
+        with wave.open(str(self.output_path), "rb") as wav_file:
+            self.assertEqual(wav_file.getframerate(), 32000)
 
     def test_deterministic_response_with_text_action_is_synthesized(self) -> None:
         response: BackendResponse = {
@@ -43,8 +55,7 @@ class ResponseSpeakerTest(unittest.TestCase):
             "actions": [show_text("Agora sao", "12:00", 3000)],
         }
 
-        with self._without_playback():
-            spoken = self.speaker.speak_response(response, "horas")
+        spoken = self.speaker.speak_response(response, "horas")
 
         self.assertTrue(spoken)
         self.assertEqual(self.tts_client.calls, [("Agora sao 12:00", self.output_path)])
@@ -76,10 +87,6 @@ class ResponseSpeakerTest(unittest.TestCase):
         response: BackendResponse = {"text": "Pergunta em idle", "interaction_state": "idle", "actions": []}
 
         self.assertIsNone(get_spoken_text(response, "Pergunta em idle"))
-
-    def _without_playback(self):
-        return patch("services.tts.response_speaker.winsound.PlaySound")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ class BackendResponse(TypedDict, total=False):
     interaction_state: str
     command_window_ms: int
     actions: list[ExpressionAction | ShowTextAction]
+    audio_available: bool
 
 
 def expression(value: str) -> ExpressionAction:

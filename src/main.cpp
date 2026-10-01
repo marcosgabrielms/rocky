@@ -6,6 +6,7 @@
 
 #include "drivers/Display.h"
 #include "drivers/Microphone.h"
+#include "drivers/Speaker.h"
 #include "core/CommandProcessor.h"
 #include "core/TimeService.h"
 #include "dataset/DatasetCollector.h"
@@ -18,6 +19,7 @@
 
 Display display;
 Microphone microphone;
+Speaker speaker;
 VoiceActivityDetector voiceActivityDetector;
 SpeechCapture speechCapture;
 Eyes eyes(display);
@@ -39,6 +41,7 @@ constexpr uint32_t COMMAND_WINDOW_DURATION_MS = 6000;
 constexpr bool SERIAL_VERBOSE_AUDIO = false;
 constexpr bool MIC_DIAGNOSTIC_MODE = false;
 constexpr bool VAD_TRIGGER_DIAGNOSTICS = false;
+constexpr bool SPEAKER_TEST_TONE_ENABLED = false;
 constexpr uint32_t MIC_FRAME_DURATION_MS = MIC_BLOCK_SAMPLES * 1000UL / SpeechCapture::SAMPLE_RATE;
 constexpr uint32_t NOISE_WINDOW_MS = 750;
 constexpr size_t NOISE_WINDOW_FRAMES = NOISE_WINDOW_MS / MIC_FRAME_DURATION_MS;
@@ -501,6 +504,8 @@ void sendCompletedSpeech()
                       static_cast<unsigned long>(millis() - requestStartedAt));
         reportCaptureMemory("before_backend_parse");
         handleBackendResponse(response);
+        if (response.audioAvailable)
+            sttClient.playResponseAudio(speaker);
         reportCaptureMemory("after_backend_parse");
     }
     else
@@ -848,6 +853,9 @@ void setup()
     }
 
     Serial.println("INMP441 inicializado.");
+    if (speaker.begin() && SPEAKER_TEST_TONE_ENABLED)
+        speaker.playTestTone();
+
     voiceActivityDetector.begin();
     if (!speechCapture.begin())
         Serial.println("Falha ao alocar buffer de captura na PSRAM.");

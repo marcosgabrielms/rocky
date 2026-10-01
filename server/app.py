@@ -9,11 +9,12 @@ import wave
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 from services.conversation import ConversationManager
 from services.llm import OpenRouterLLMClient
 from services.stt import SAMPLE_RATE, transcribe as transcribe_audio, validate_wav
-from services.tts import LocalResponseSpeaker, PiperTTS
+from services.tts import LocalResponseSpeaker, PiperTTS, get_local_playback_enabled
 
 
 MAX_UPLOAD_BYTES = 1024 * 1024
@@ -29,7 +30,11 @@ TTS_OUTPUT_PATH = TTS_DIRECTORY / "rocky_response.wav"
 app = FastAPI()
 llm_client = OpenRouterLLMClient(model=os.getenv("OPENROUTER_MODEL", DEFAULT_CONVERSATION_LLM_MODEL))
 conversation_manager = ConversationManager(COMMAND_WINDOW_MS, llm_client)
-response_speaker = LocalResponseSpeaker(PiperTTS(TTS_MODEL_PATH), TTS_OUTPUT_PATH)
+response_speaker = LocalResponseSpeaker(
+    PiperTTS(TTS_MODEL_PATH),
+    TTS_OUTPUT_PATH,
+    enable_local_playback=get_local_playback_enabled(),
+)
 
 
 @app.get("/health")
@@ -52,8 +57,17 @@ async def transcribe(
     text = transcribe_audio(audio_data, file.filename, use_wake_hotword)
     print("[STT] transcription completed")
     response = conversation_manager.build_response(text, x_rocky_device)
-    response_speaker.speak_response(response, text)
+    response["audio_available"] = response_speaker.speak_response(response, text)
     return response
+
+
+@app.get("/audio/rocky_response.wav")
+def get_response_audio() -> FileResponse:
+    if not TTS_OUTPUT_PATH.is_file() or TTS_OUTPUT_PATH.stat().st_size == 0:
+        raise HTTPException(status_code=404, detail="Audio indisponivel.")
+
+    print(f"[AUDIO] served path={TTS_OUTPUT_PATH.name} bytes={TTS_OUTPUT_PATH.stat().st_size}")
+    return FileResponse(TTS_OUTPUT_PATH, media_type="audio/wav")
 
 
 @app.post("/dataset")

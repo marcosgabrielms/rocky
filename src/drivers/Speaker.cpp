@@ -25,6 +25,7 @@ bool Speaker::begin()
     }
 
     Serial.println("[SPEAKER] init ok");
+    Serial.printf("[AUDIO] output_volume=%ld%%\n", static_cast<long>(OUTPUT_VOLUME_PERCENT));
     writeSilence();
     Serial.println("[SPEAKER] silence");
     return true;
@@ -89,7 +90,7 @@ bool Speaker::playMonoPcm(const int16_t* samples, size_t sampleCount)
         const size_t framesInBlock = min(FRAMES_PER_BLOCK, sampleCount - sampleOffset);
         for (size_t frame = 0; frame < framesInBlock; ++frame)
         {
-            const int16_t sample = samples[sampleOffset + frame];
+            const int16_t sample = scaleOutputSample(samples[sampleOffset + frame]);
             frames[frame * SAMPLES_PER_FRAME] = sample;
             frames[frame * SAMPLES_PER_FRAME + 1] = sample;
         }
@@ -101,6 +102,16 @@ bool Speaker::playMonoPcm(const int16_t* samples, size_t sampleCount)
     }
 
     return true;
+}
+
+int16_t Speaker::scaleOutputSample(int16_t sample)
+{
+    const int32_t scaled = static_cast<int32_t>(sample) * OUTPUT_VOLUME_PERCENT / 100;
+    if (scaled > INT16_MAX)
+        return INT16_MAX;
+    if (scaled < INT16_MIN)
+        return INT16_MIN;
+    return static_cast<int16_t>(scaled);
 }
 
 void Speaker::stop()

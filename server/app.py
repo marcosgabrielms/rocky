@@ -5,27 +5,34 @@ import io
 import math
 import os
 import struct
+import time
 import wave
 from pathlib import Path
+from threading import Thread
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
-from services.conversation import ConversationManager
+from services.conversation import ConversationManager, InteractionKind
 from services.llm import OpenRouterLLMClient
+from services.realtime_audio import RealtimeAudioService
 from services.stt import SAMPLE_RATE, transcribe as transcribe_audio, validate_wav
-from services.tts import LocalResponseSpeaker, PiperTTS, get_local_playback_enabled
+from services.tts import LocalResponseSpeaker, PiperTTS, RealtimeTTS, get_local_playback_enabled
+from services.audio_queue import AudioProductionStatus
 
 
 MAX_UPLOAD_BYTES = 1024 * 1024
 EXPECTED_CONTENT_TYPE = "audio/wav"
 COMMAND_WINDOW_MS = 10000
-DEFAULT_CONVERSATION_LLM_MODEL = "openai/gpt-oss-20b:free"
+DEFAULT_CONVERSATION_LLM_MODEL = "openrouter/free"
 DATASET_DIRECTORY = Path(__file__).parent / "dataset"
 CALIBRATION_DIRECTORY = Path(__file__).parent / "calibration"
 TTS_DIRECTORY = Path(__file__).parent / "local" / "tts"
 TTS_MODEL_PATH = TTS_DIRECTORY / "voices" / "pt_BR-jeff-medium.onnx"
 TTS_OUTPUT_PATH = TTS_DIRECTORY / "rocky_response.wav"
+REALTIME_TTS_DIRECTORY = TTS_DIRECTORY / "realtime"
+REALTIME_LONG_POLL_MAX_MS = 1000
+REALTIME_LONG_POLL_INTERVAL_MS = 50
 
 app = FastAPI()
 llm_client = OpenRouterLLMClient(model=os.getenv("OPENROUTER_MODEL", DEFAULT_CONVERSATION_LLM_MODEL))
@@ -34,6 +41,10 @@ response_speaker = LocalResponseSpeaker(
     PiperTTS(TTS_MODEL_PATH),
     TTS_OUTPUT_PATH,
     enable_local_playback=get_local_playback_enabled(),
+)
+realtime_audio_service = RealtimeAudioService(
+    conversation_manager,
+    RealtimeTTS(PiperTTS(TTS_MODEL_PATH), REALTIME_TTS_DIRECTORY),
 )
 
 
@@ -59,6 +70,100 @@ async def transcribe(
     response = conversation_manager.build_response(text, x_rocky_device)
     response["audio_available"] = response_speaker.speak_response(response, text)
     return response
+
+
+@app.post("/transcribe/realtime")
+async def transcribe_realtime(
+    file: UploadFile | None = File(default=None),
+    x_rocky_device: str = Header(default="rocky-01"),
+) -> dict[str, object]:
+    audio_data = await read_wav_upload(file)
+    duration_seconds = validate_wav(audio_data)
+    print("[RTD] request received")
+    print(f"[RTD] wav duration={duration_seconds:.1f}s")
+    use_wake_hotword = not conversation_manager.has_active_command_window(x_rocky_device)
+    text = transcribe_audio(audio_data, file.filename, use_wake_hotword)
+    decision = conversation_manager.classify(text, x_rocky_device)
+    print(f"[RTD] classify kind={decision.kind}")
+    if decision.kind is not InteractionKind.LLM:
+        response = conversation_manager.build_response_from_decision(decision)
+        response["audio_available"] = response_speaker.speak_response(response, text)
+        return {"realtime": False, "interaction_id": None, **response}
+
+    interaction_id = realtime_audio_service.create_interaction()
+    print(f"[RTD] interaction_created id={interaction_id}")
+    started_at = time.monotonic()
+
+    def produce() -> None:
+        result = realtime_audio_service.build_stream_audio_response_from_decision(decision, interaction_id)
+        if result.audio_segments:
+            elapsed_ms = round((time.monotonic() - started_at) * 1000)
+            print(f"[RTD] first_audio_available_ms={elapsed_ms}")
+
+    Thread(target=produce, name=f"rocky-realtime-{interaction_id}", daemon=True).start()
+    return {
+        "realtime": True,
+        "interaction_id": interaction_id,
+        "text": "",
+        "interaction_state": "thinking",
+        "actions": [],
+        "audio_available": False,
+    }
+
+
+@app.get("/realtime/audio/{interaction_id}/next")
+def get_next_realtime_audio(interaction_id: int, timeout_ms: int = REALTIME_LONG_POLL_MAX_MS):
+    timeout_ms = min(max(timeout_ms, 0), REALTIME_LONG_POLL_MAX_MS)
+    started_at = time.monotonic()
+    queue = realtime_audio_service.audio_queue
+    while True:
+        try:
+            item = queue.next_item(interaction_id)
+            state = queue.state(interaction_id)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail="Interacao realtime desconhecida.") from error
+
+        if item is not None:
+            print(f"[RTD] served id={interaction_id} seq={item.sequence}")
+            return FileResponse(
+                item.audio_path,
+                media_type="audio/wav",
+                headers={
+                    "X-Rocky-Interaction": str(item.interaction_id),
+                    "X-Rocky-Sequence": str(item.sequence),
+                    "X-Rocky-Status": "ready",
+                    "X-Rocky-Duration-Ms": str(item.duration_ms),
+                    "X-Rocky-Sample-Rate": str(item.sample_rate),
+                    "X-Rocky-Channels": str(item.channels),
+                    "X-Rocky-Bits-Per-Sample": str(item.bits_per_sample),
+                    "X-Rocky-Audio-Bytes": str(item.audio_bytes),
+                },
+            )
+        if state.production_status is AudioProductionStatus.COMPLETED:
+            print(f"[RTD] done id={interaction_id}")
+            return _realtime_status("done")
+        if state.production_status is AudioProductionStatus.FAILED:
+            return _realtime_status("failed")
+        if state.production_status is AudioProductionStatus.CANCELLED:
+            return _realtime_status("cancelled")
+        if (time.monotonic() - started_at) * 1000 >= timeout_ms:
+            print(f"[RTD] next_wait_ms={round((time.monotonic() - started_at) * 1000)}")
+            return _realtime_status("pending")
+        time.sleep(REALTIME_LONG_POLL_INTERVAL_MS / 1000)
+
+
+@app.post("/realtime/audio/{interaction_id}/{sequence}/consumed")
+def acknowledge_realtime_audio(interaction_id: int, sequence: int) -> dict[str, int | str]:
+    try:
+        realtime_audio_service.audio_queue.mark_consumed(interaction_id, sequence)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail="ACK realtime invalido.") from error
+    print(f"[RTD] consumed id={interaction_id} seq={sequence}")
+    return {"status": "consumed", "interaction_id": interaction_id, "sequence": sequence}
+
+
+def _realtime_status(status: str) -> JSONResponse:
+    return JSONResponse({"status": status})
 
 
 @app.get("/audio/rocky_response.wav")

@@ -4,7 +4,12 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 
-HOURS_ALIASES = frozenset({"horas", "hora", "hores", "oras", "ors"})
+HOURS_ALIASES = frozenset({
+    "horas", "hora", "hores", "oras", "ors",
+    "que horas são", "que horas sao", "que horas é", "que horas e",
+    "qual a hora", "qual é a hora", "qual e a hora",
+    "me diga as horas", "me diga a hora",
+})
 SAO_PAULO_TIMEZONE_NAME = "America/Sao_Paulo"
 
 

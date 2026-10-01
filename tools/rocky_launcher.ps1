@@ -34,7 +34,7 @@ if (-not $startApi) {
 }
 
 do {
-    $answer = Read-Host "Usar o modelo openai/gpt-oss-20b:free? [S/N]"
+    $answer = Read-Host "Usar o modelo gratuito openrouter/free? [S/N]"
     switch ($answer.Trim().ToUpperInvariant()) {
         "S" { $useRockyModel = $true }
         "N" { $useRockyModel = $false }
@@ -47,7 +47,7 @@ if (-not $useRockyModel) {
     exit 0
 }
 
-$env:OPENROUTER_MODEL = "openai/gpt-oss-20b:free"
+$env:OPENROUTER_MODEL = "openrouter/free"
 $secureApiKey = Read-Host "Cole sua chave OpenRouter" -AsSecureString
 $apiKeyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureApiKey)
 try {

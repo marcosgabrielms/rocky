@@ -30,6 +30,8 @@ void Eyes::update(uint32_t now)
     gazeX = approach(gazeX, targetGazeX, GAZE_SPEED * elapsedSeconds);
     gazeY = approach(gazeY, targetGazeY, GAZE_SPEED * elapsedSeconds);
     blinkAmount = approach(blinkAmount, targetBlinkAmount, BLINK_SPEED * elapsedSeconds);
+    speakingHeightOffset = approach(speakingHeightOffset, targetSpeakingHeightOffset,
+                                    SPEAKING_HEIGHT_SPEED * elapsedSeconds);
 
     if (attentionConfirming && now - attentionStartedAt >= ATTENTION_CONFIRMATION_DURATION_MS)
     {
@@ -38,7 +40,8 @@ void Eyes::update(uint32_t now)
     }
 
     const bool isAnimating = gazeX != targetGazeX || gazeY != targetGazeY ||
-                             blinkAmount != targetBlinkAmount;
+                             blinkAmount != targetBlinkAmount ||
+                             speakingHeightOffset != targetSpeakingHeightOffset;
 
     if ((!redrawRequested && !isAnimating) || now - lastDraw < FRAME_INTERVAL_MS)
         return;
@@ -105,6 +108,13 @@ void Eyes::setVisualState(VisualState newState, bool showConfirmation)
     visualState = newState;
     attentionStartedAt = millis();
     attentionConfirming = newState == VisualState::Attention && showConfirmation;
+    speakingHeightOffset = 0.0F;
+    targetSpeakingHeightOffset = 0.0F;
+    if (newState == VisualState::Speaking)
+    {
+        blinkAmount = 0.0F;
+        targetBlinkAmount = 0.0F;
+    }
 
     if (newState == VisualState::Attention)
         lookCenter();
@@ -115,6 +125,12 @@ void Eyes::setVisualState(VisualState newState, bool showConfirmation)
 void Eyes::setMood(Mood newMood)
 {
     mood = newMood;
+    redrawRequested = true;
+}
+
+void Eyes::setSpeakingHeightOffset(int16_t offset)
+{
+    targetSpeakingHeightOffset = static_cast<float>(offset);
     redrawRequested = true;
 }
 
@@ -183,6 +199,9 @@ int16_t Eyes::baseEyeHeight() const
 
     if (visualState == VisualState::Thinking)
         return THINKING_EYE_HEIGHT;
+
+    if (visualState == VisualState::Speaking)
+        return SPEAKING_EYE_HEIGHT + static_cast<int16_t>(std::lround(speakingHeightOffset));
 
     if (visualState == VisualState::Attention)
         return ATTENTION_EYE_HEIGHT;

@@ -12,7 +12,8 @@ public:
         Idle,
         Attention,
         Listening,
-        Thinking
+        Thinking,
+        Speaking
     };
 
     enum class Mood : uint8_t
@@ -37,6 +38,7 @@ public:
     void setBlinking(bool blinking);
     void setVisualState(VisualState state, bool showConfirmation = true);
     void setMood(Mood mood);
+    void setSpeakingHeightOffset(int16_t offset);
     bool isAttentionConfirming() const;
 
 private:
@@ -49,6 +51,8 @@ private:
     static constexpr int16_t LISTENING_EYE_HEIGHT = 28;
     static constexpr int16_t THINKING_EYE_WIDTH = 28;
     static constexpr int16_t THINKING_EYE_HEIGHT = 10;
+    static constexpr int16_t SPEAKING_EYE_HEIGHT = 36;
+    static constexpr float SPEAKING_HEIGHT_SPEED = 24.0F;
     static constexpr int16_t MIN_EYE_HEIGHT = 3;
     static constexpr int16_t MAX_GAZE_X = 7;
     static constexpr int16_t MAX_GAZE_Y = 5;
@@ -66,6 +70,8 @@ private:
     float targetGazeY = 0.0F;
     float blinkAmount = 0.0F;
     float targetBlinkAmount = 0.0F;
+    float speakingHeightOffset = 0.0F;
+    float targetSpeakingHeightOffset = 0.0F;
     uint32_t lastUpdate = 0;
     uint32_t lastDraw = 0;
     uint32_t attentionStartedAt = 0;

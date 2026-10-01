@@ -26,6 +26,7 @@ private:
     static constexpr uint32_t BLINK_OPEN_MS = 130;
     static constexpr uint32_t GAZE_INTERVAL_MS = 2200;
     static constexpr uint32_t ATTENTION_GAZE_INTERVAL_MS = 1100;
+    static constexpr uint32_t SPEAKING_POSE_INTERVAL_MS = 220;
 
     Eyes& eyes;
     Eyes::VisualState visualState = Eyes::VisualState::Idle;
@@ -34,9 +35,12 @@ private:
     uint32_t lastGazeChangeAt = 0;
     uint8_t gazeIndex = 0;
     uint8_t attentionGazeIndex = 0;
+    uint8_t speakingPoseIndex = 0;
+    uint32_t lastSpeakingPoseAt = 0;
 
     void updateBlink(uint32_t now);
     void updateGaze(uint32_t now);
+    void updateSpeaking(uint32_t now);
     void applyNextGaze();
     void applyNextAttentionGaze();
 };

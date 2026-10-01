@@ -45,9 +45,26 @@ public:
         bool valid = false;
     };
 
+    struct RealtimeResponse
+    {
+        bool realtime = false;
+        uint32_t interactionId = 0;
+        BackendResponse backendResponse;
+        bool valid = false;
+    };
+
+    struct PlaybackCallbacks
+    {
+        void (*onStarted)() = nullptr;
+        void (*onProgress)() = nullptr;
+    };
+
     bool checkHealth();
     bool transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendResponse& response);
-    bool playResponseAudio(Speaker& speaker);
+    bool transcribeRealtime(const int16_t* pcm16, size_t pcmByteCount, RealtimeResponse& response);
+    bool playResponseAudio(Speaker& speaker, const PlaybackCallbacks& callbacks);
+    bool playRealtimeInteraction(Speaker& speaker, uint32_t interactionId,
+                                 const PlaybackCallbacks& callbacks);
     bool uploadDataset(const int16_t* pcm16, size_t pcmByteCount, const char* label, uint32_t& index);
     bool uploadCalibration(const int16_t* pcm16,
                            size_t pcmByteCount,
@@ -64,12 +81,30 @@ private:
         uint16_t channels = 0;
     };
 
+    struct HttpResponseHeaders
+    {
+        size_t contentLength = 0;
+        bool isWavResponse = false;
+        bool hasInteractionId = false;
+        bool hasSequence = false;
+        uint32_t interactionId = 0;
+        uint32_t sequence = 0;
+    };
+
     static constexpr uint32_t HTTP_TIMEOUT_MS = 60000;
 
     bool sendGetRequest(WiFiClient& client) const;
     bool sendMultipartRequest(WiFiClient& client,
                               const int16_t* pcm16,
                               size_t pcmByteCount) const;
+    bool sendRealtimeMultipartRequest(WiFiClient& client,
+                                      const int16_t* pcm16,
+                                      size_t pcmByteCount) const;
+    bool playAudioPath(Speaker& speaker, const String& path, const PlaybackCallbacks& callbacks);
+    bool playWavResponse(Speaker& speaker, WiFiClient& client, size_t wavSize,
+                         const PlaybackCallbacks& callbacks, const uint32_t* sequence = nullptr,
+                         const uint32_t* previousPlaybackEnd = nullptr) const;
+    bool acknowledgeRealtimeSegment(uint32_t interactionId, uint32_t sequence) const;
     bool sendDatasetRequest(WiFiClient& client,
                             const int16_t* pcm16,
                             size_t pcmByteCount,
@@ -80,8 +115,9 @@ private:
                                 const CalibrationMetadata& metadata) const;
     static bool writeAll(WiFiClient& client, const uint8_t* data, size_t dataSize);
     static int readStatusCode(WiFiClient& client);
-    static int readResponseHeaders(WiFiClient& client, size_t& contentLength);
-    static String readResponseBody(WiFiClient& client);
+    static int readResponseHeaders(WiFiClient& client, HttpResponseHeaders& headers,
+                                    void (*onProgress)() = nullptr);
+    static String readResponseBody(WiFiClient& client, void (*onProgress)() = nullptr);
     static bool parseWav(const uint8_t* wavData, size_t wavSize, WavInfo& wavInfo);
     static bool isHealthyResponse(const String& json);
     static bool extractText(const String& json, String& text);

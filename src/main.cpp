@@ -53,6 +53,7 @@ enum class InteractionState : uint8_t
     Idle,
     WaitingCommand,
     ProcessingCommand,
+    Speaking,
     ShowingResponse
 };
 
@@ -105,7 +106,9 @@ InteractionState interactionState = InteractionState::Idle;
 Eyes::VisualState currentVisualState = Eyes::VisualState::Idle;
 
 void handleTranscription(const String& text);
-void handleBackendResponse(const SttClient::BackendResponse& response);
+void handleBackendResponse(const SttClient::BackendResponse& response, bool deferVisualState = false);
+void beginSpeaking();
+void updateSpeakingVisual();
 void handleWakeWord(const String& text);
 void handleCommand(const String& text);
 void updateTimeScreen(uint32_t now);
@@ -496,16 +499,37 @@ void sendCompletedSpeech()
 
     reportCaptureMemory("before_stt");
     const uint32_t requestStartedAt = millis();
-    SttClient::BackendResponse response;
-    if (sttClient.transcribe(speechCapture.getPcm16(), speechCapture.getPcmByteCount(), response))
+    const SttClient::PlaybackCallbacks playbackCallbacks{beginSpeaking, updateSpeakingVisual};
+    SttClient::RealtimeResponse realtimeResponse;
+    if (sttClient.transcribeRealtime(speechCapture.getPcm16(), speechCapture.getPcmByteCount(), realtimeResponse))
     {
-        Serial.printf("[STT] text=\"%s\"\n", response.text.c_str());
         Serial.printf("[STT] elapsed_ms=%lu\n",
                       static_cast<unsigned long>(millis() - requestStartedAt));
         reportCaptureMemory("before_backend_parse");
-        handleBackendResponse(response);
-        if (response.audioAvailable)
-            sttClient.playResponseAudio(speaker);
+        if (!realtimeResponse.realtime)
+        {
+            Serial.println("[RT] realtime=false");
+            Serial.printf("[STT] text=\"%s\"\n", realtimeResponse.backendResponse.text.c_str());
+            handleBackendResponse(realtimeResponse.backendResponse,
+                                  realtimeResponse.backendResponse.audioAvailable);
+            if (realtimeResponse.backendResponse.audioAvailable)
+            {
+                sttClient.playResponseAudio(speaker, playbackCallbacks);
+                returnToIdle();
+                if (showingTime)
+                {
+                    display.showTime(realtimeResponse.backendResponse.action.line2);
+                    timeScreenStartedAt = millis();
+                }
+            }
+        }
+        else
+        {
+            Serial.printf("[RT] interaction=%lu\n", static_cast<unsigned long>(realtimeResponse.interactionId));
+            if (!sttClient.playRealtimeInteraction(speaker, realtimeResponse.interactionId, playbackCallbacks))
+                Serial.println("[RT] interaction_failed");
+            returnToIdle();
+        }
         reportCaptureMemory("after_backend_parse");
     }
     else
@@ -517,7 +541,24 @@ void sendCompletedSpeech()
     reportCaptureMemory("after_stt");
 }
 
-void handleBackendResponse(const SttClient::BackendResponse& response)
+void beginSpeaking()
+{
+    if (interactionState == InteractionState::Speaking)
+        return;
+
+    interactionState = InteractionState::Speaking;
+    visualCommandWindowActive = false;
+    showingAttentionPrompt = false;
+    setVisualState(Eyes::VisualState::Speaking, false);
+}
+
+void updateSpeakingVisual()
+{
+    if (interactionState == InteractionState::Speaking)
+        animator.update();
+}
+
+void handleBackendResponse(const SttClient::BackendResponse& response, bool deferVisualState)
 {
     Serial.printf("[BACKEND] state=%s\n", response.interactionState.c_str());
 
@@ -527,7 +568,10 @@ void handleBackendResponse(const SttClient::BackendResponse& response)
         if (response.action.value == "attention")
             setVisualState(Eyes::VisualState::Attention, false);
         else if (response.action.value == "idle")
-            setVisualState(Eyes::VisualState::Idle);
+        {
+            if (!deferVisualState)
+                setVisualState(Eyes::VisualState::Idle);
+        }
         else
             Serial.printf("[ACTION] unsupported=%s\n", response.action.value.c_str());
     }
@@ -573,7 +617,8 @@ void handleBackendResponse(const SttClient::BackendResponse& response)
         backendConversationActive = false;
         visualCommandWindowActive = false;
         showingAttentionPrompt = false;
-        setVisualState(Eyes::VisualState::Idle);
+        if (!deferVisualState && !showingTime)
+            setVisualState(Eyes::VisualState::Idle);
     }
     else if (response.interactionState != "idle")
         Serial.printf("[BACKEND] unsupported state=%s\n", response.interactionState.c_str());
@@ -712,6 +757,8 @@ void setVisualState(Eyes::VisualState state, bool showConfirmation)
             return "LISTENING";
         case Eyes::VisualState::Thinking:
             return "THINKING";
+        case Eyes::VisualState::Speaking:
+            return "SPEAKING";
         }
 
         return "UNKNOWN";

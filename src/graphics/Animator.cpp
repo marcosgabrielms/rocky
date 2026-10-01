@@ -16,8 +16,13 @@ void Animator::begin()
 void Animator::update()
 {
     const uint32_t now = millis();
-    updateBlink(now);
-    updateGaze(now);
+    if (visualState == Eyes::VisualState::Speaking)
+        updateSpeaking(now);
+    else
+    {
+        updateBlink(now);
+        updateGaze(now);
+    }
     eyes.update(now);
 }
 
@@ -31,7 +36,8 @@ void Animator::setVisualState(Eyes::VisualState newState, bool showConfirmation)
 
     if (visualState == Eyes::VisualState::Attention ||
         visualState == Eyes::VisualState::Listening ||
-        visualState == Eyes::VisualState::Thinking)
+        visualState == Eyes::VisualState::Thinking ||
+        visualState == Eyes::VisualState::Speaking)
     {
         eyes.lookCenter();
 
@@ -40,7 +46,26 @@ void Animator::setVisualState(Eyes::VisualState newState, bool showConfirmation)
     }
 
     lastGazeChangeAt = millis();
+    if (visualState == Eyes::VisualState::Speaking)
+    {
+        speakingPoseIndex = 0;
+        lastSpeakingPoseAt = lastGazeChangeAt;
+        blinkState = BlinkState::Waiting;
+        stateStartedAt = lastGazeChangeAt;
+        eyes.setBlinking(false);
+    }
     eyes.render();
+}
+
+void Animator::updateSpeaking(uint32_t now)
+{
+    if (now - lastSpeakingPoseAt < SPEAKING_POSE_INTERVAL_MS)
+        return;
+
+    constexpr int16_t HEIGHT_OFFSETS[] = {0, -3, 0, 3};
+    speakingPoseIndex = (speakingPoseIndex + 1) % 4;
+    eyes.setSpeakingHeightOffset(HEIGHT_OFFSETS[speakingPoseIndex]);
+    lastSpeakingPoseAt = now;
 }
 
 void Animator::updateBlink(uint32_t now)

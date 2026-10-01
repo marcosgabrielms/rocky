@@ -22,6 +22,7 @@ constexpr uint16_t PCM_BITS_PER_SAMPLE = 16;
 constexpr uint32_t PCM_SAMPLE_RATE = 16000;
 constexpr char DEVICE_ID[] = "rocky-01";
 constexpr char RESPONSE_AUDIO_PATH[] = "/audio/rocky_response.wav";
+constexpr char REALTIME_TRANSCRIBE_PATH[] = "/transcribe/realtime";
 constexpr size_t RESPONSE_AUDIO_BLOCK_BYTES = 4096;
 constexpr size_t MAX_RESPONSE_AUDIO_BYTES = 1024 * 1024;
 constexpr uint32_t RESPONSE_AUDIO_SAMPLE_RATE = 32000;
@@ -137,7 +138,40 @@ bool SttClient::transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendRes
     return true;
 }
 
-bool SttClient::playResponseAudio(Speaker& speaker)
+bool SttClient::transcribeRealtime(const int16_t* pcm16, size_t pcmByteCount, RealtimeResponse& response)
+{
+    response = {};
+    WiFiClient client;
+    client.setTimeout(HTTP_TIMEOUT_MS);
+    if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) || !sendRealtimeMultipartRequest(client, pcm16, pcmByteCount))
+    {
+        client.stop();
+        return false;
+    }
+    const int statusCode = readStatusCode(client);
+    const String body = readResponseBody(client);
+    client.stop();
+    if (statusCode != 200 || !extractJsonBoolean(body, "realtime", response.realtime))
+        return false;
+
+    if (response.realtime)
+    {
+        if (!extractJsonUnsigned(body, "interaction_id", response.interactionId))
+            return false;
+    }
+    else if (!extractBackendResponse(body, response.backendResponse))
+        return false;
+
+    response.valid = true;
+    return true;
+}
+
+bool SttClient::playResponseAudio(Speaker& speaker, const PlaybackCallbacks& callbacks)
+{
+    return playAudioPath(speaker, RESPONSE_AUDIO_PATH, callbacks);
+}
+
+bool SttClient::playAudioPath(Speaker& speaker, const String& path, const PlaybackCallbacks& callbacks)
 {
     WiFiClient client;
     client.setTimeout(HTTP_TIMEOUT_MS);
@@ -145,7 +179,7 @@ bool SttClient::playResponseAudio(Speaker& speaker)
 
     if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) ||
         client.printf("GET %s HTTP/1.1\r\nHost: %s:%u\r\nConnection: close\r\n\r\n",
-                      RESPONSE_AUDIO_PATH,
+                      path.c_str(),
                       STT_SERVER_HOST,
                       STT_SERVER_PORT) <= 0)
     {
@@ -154,19 +188,28 @@ bool SttClient::playResponseAudio(Speaker& speaker)
         return false;
     }
 
-    size_t wavSize = 0;
-    if (readResponseHeaders(client, wavSize) != 200 || wavSize == 0 || wavSize > MAX_RESPONSE_AUDIO_BYTES)
+    HttpResponseHeaders headers;
+    if (readResponseHeaders(client, headers) != 200 || headers.contentLength == 0 ||
+        headers.contentLength > MAX_RESPONSE_AUDIO_BYTES)
     {
         Serial.println("[AUDIO] download failed");
         client.stop();
         return false;
     }
 
+    const bool played = playWavResponse(speaker, client, headers.contentLength, callbacks);
+    client.stop();
+    return played;
+}
+
+bool SttClient::playWavResponse(Speaker& speaker, WiFiClient& client, size_t wavSize,
+                              const PlaybackCallbacks& callbacks, const uint32_t* sequence,
+                              const uint32_t* previousPlaybackEnd) const
+{
     uint8_t* const wavData = static_cast<uint8_t*>(heap_caps_malloc(wavSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (wavData == nullptr)
     {
         Serial.println("[AUDIO] download failed");
-        client.stop();
         return false;
     }
 
@@ -184,9 +227,9 @@ bool SttClient::playResponseAudio(Speaker& speaker)
             ++shortReads;
         ++downloadChunks;
         receivedBytes += chunkBytes;
+        if (callbacks.onProgress != nullptr)
+            callbacks.onProgress();
     }
-    client.stop();
-
     if (receivedBytes != wavSize)
     {
         heap_caps_free(wavData);
@@ -215,6 +258,18 @@ bool SttClient::playResponseAudio(Speaker& speaker)
         return false;
     }
 
+    if (callbacks.onStarted != nullptr)
+        callbacks.onStarted();
+    if (sequence != nullptr)
+    {
+        Serial.printf("[RT] audio_received seq=%lu bytes=%u\n",
+                      static_cast<unsigned long>(*sequence), static_cast<unsigned>(receivedBytes));
+        if (previousPlaybackEnd != nullptr)
+            Serial.printf("[RT] inter_segment_gap_ms=%lu\n",
+                          static_cast<unsigned long>(millis() - *previousPlaybackEnd));
+        Serial.printf("[RT] playback_start seq=%lu\n", static_cast<unsigned long>(*sequence));
+    }
+
     const uint32_t expectedMs = static_cast<uint32_t>(wavInfo.pcmByteCount * 1000UL /
                                                       (wavInfo.sampleRate * wavInfo.channels * sizeof(int16_t)));
     const uint32_t playbackStartedAt = millis();
@@ -236,6 +291,8 @@ bool SttClient::playResponseAudio(Speaker& speaker)
 
         ++playbackChunks;
         playedBytes += chunkBytes;
+        if (callbacks.onProgress != nullptr)
+            callbacks.onProgress();
     }
 
     speaker.stop();
@@ -250,6 +307,118 @@ bool SttClient::playResponseAudio(Speaker& speaker)
     Serial.printf("[AUDIO] download_chunks=%lu\n", static_cast<unsigned long>(downloadChunks));
     Serial.println("[AUDIO] playback end");
     return true;
+}
+
+bool SttClient::playRealtimeInteraction(Speaker& speaker, uint32_t interactionId,
+                                       const PlaybackCallbacks& callbacks)
+{
+    uint32_t expectedSequence = 0;
+    uint32_t playbackEndedAt = 0;
+    bool hasPreviousPlayback = false;
+    while (true)
+    {
+        WiFiClient client;
+        client.setTimeout(HTTP_TIMEOUT_MS);
+        const String path = String("/realtime/audio/") + interactionId + "/next?timeout_ms=1000";
+        Serial.printf("[RT] waiting_audio seq=%lu\n", static_cast<unsigned long>(expectedSequence));
+        if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) ||
+            client.printf("GET %s HTTP/1.1\r\nHost: %s:%u\r\nConnection: close\r\n\r\n",
+                          path.c_str(), STT_SERVER_HOST, STT_SERVER_PORT) <= 0)
+        {
+            client.stop();
+            Serial.println("[RT] audio request failed");
+            return false;
+        }
+        HttpResponseHeaders headers;
+        const int statusCode = readResponseHeaders(client, headers, callbacks.onProgress);
+        if (statusCode == 200 && headers.isWavResponse)
+        {
+            if (!headers.hasInteractionId)
+            {
+                client.stop();
+                Serial.println("[RT] missing_interaction_header");
+                return false;
+            }
+            if (!headers.hasSequence)
+            {
+                client.stop();
+                Serial.println("[RT] missing_sequence_header");
+                return false;
+            }
+            if (headers.interactionId != interactionId)
+            {
+                client.stop();
+                Serial.printf("[RT] interaction_mismatch expected=%lu received=%lu\n",
+                              static_cast<unsigned long>(interactionId),
+                              static_cast<unsigned long>(headers.interactionId));
+                return false;
+            }
+            if (headers.sequence != expectedSequence)
+            {
+                client.stop();
+                Serial.printf("[RT] sequence_mismatch expected=%lu received=%lu\n",
+                              static_cast<unsigned long>(expectedSequence),
+                              static_cast<unsigned long>(headers.sequence));
+                return false;
+            }
+            if (headers.contentLength == 0 || headers.contentLength > MAX_RESPONSE_AUDIO_BYTES)
+            {
+                client.stop();
+                Serial.println("[RT] invalid_audio_size");
+                return false;
+            }
+
+            Serial.printf("[RT] headers interaction=%lu seq=%lu\n",
+                          static_cast<unsigned long>(headers.interactionId),
+                          static_cast<unsigned long>(headers.sequence));
+            const bool playbackSucceeded = playWavResponse(
+                speaker, client, headers.contentLength, callbacks, &expectedSequence,
+                hasPreviousPlayback ? &playbackEndedAt : nullptr);
+            client.stop();
+            if (!playbackSucceeded)
+            {
+                Serial.println("[RT] playback_failed");
+                return false;
+            }
+            playbackEndedAt = millis();
+            hasPreviousPlayback = true;
+            Serial.printf("[RT] playback_end seq=%lu\n", static_cast<unsigned long>(expectedSequence));
+            if (!acknowledgeRealtimeSegment(interactionId, expectedSequence))
+            {
+                Serial.println("[RT] ack_failed");
+                return false;
+            }
+            Serial.printf("[RT] ack seq=%lu\n", static_cast<unsigned long>(expectedSequence));
+            ++expectedSequence;
+            continue;
+        }
+        const String body = readResponseBody(client, callbacks.onProgress);
+        client.stop();
+        String status;
+        extractJsonString(body, "status", status);
+        if (status == "pending")
+            continue;
+        if (status == "done")
+        {
+            Serial.println("[RT] interaction_done");
+            return true;
+        }
+        Serial.printf("[RT] interaction_%s\n", status.c_str());
+        return false;
+    }
+}
+
+bool SttClient::acknowledgeRealtimeSegment(uint32_t interactionId, uint32_t sequence) const
+{
+    WiFiClient client;
+    client.setTimeout(HTTP_TIMEOUT_MS);
+    const String path = String("/realtime/audio/") + interactionId + "/" + sequence + "/consumed";
+    const bool sent = client.connect(STT_SERVER_HOST, STT_SERVER_PORT) &&
+                      client.printf("POST %s HTTP/1.1\r\nHost: %s:%u\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                    path.c_str(), STT_SERVER_HOST, STT_SERVER_PORT) > 0;
+    const bool acknowledged = sent && readStatusCode(client) == 200;
+    client.stop();
+    return acknowledged;
 }
 
 bool SttClient::uploadDataset(const int16_t* pcm16, size_t pcmByteCount, const char* label, uint32_t& index)
@@ -351,6 +520,25 @@ bool SttClient::sendMultipartRequest(WiFiClient& client,
     return writeAll(client,
                     reinterpret_cast<const uint8_t*>(MULTIPART_SUFFIX),
                     sizeof(MULTIPART_SUFFIX) - 1);
+}
+
+bool SttClient::sendRealtimeMultipartRequest(WiFiClient& client,
+                                             const int16_t* pcm16,
+                                             size_t pcmByteCount) const
+{
+    const size_t contentLength = sizeof(MULTIPART_PREFIX) - 1 + WAV_HEADER_SIZE + pcmByteCount + sizeof(MULTIPART_SUFFIX) - 1;
+    if (client.printf("POST %s HTTP/1.1\r\nHost: %s:%u\r\nX-Rocky-Device: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+                      REALTIME_TRANSCRIBE_PATH, STT_SERVER_HOST, STT_SERVER_PORT, DEVICE_ID, MULTIPART_BOUNDARY,
+                      static_cast<unsigned>(contentLength)) <= 0 ||
+        !writeAll(client, reinterpret_cast<const uint8_t*>(MULTIPART_PREFIX), sizeof(MULTIPART_PREFIX) - 1))
+        return false;
+    uint8_t wavHeader[WAV_HEADER_SIZE]{};
+    createWavHeader(wavHeader, pcmByteCount);
+    if (!writeAll(client, wavHeader, sizeof(wavHeader))) return false;
+    const uint8_t* pcmBytes = reinterpret_cast<const uint8_t*>(pcm16);
+    for (size_t offset = 0; offset < pcmByteCount; offset += PCM_WRITE_CHUNK_BYTES)
+        if (!writeAll(client, pcmBytes + offset, min(PCM_WRITE_CHUNK_BYTES, pcmByteCount - offset))) return false;
+    return writeAll(client, reinterpret_cast<const uint8_t*>(MULTIPART_SUFFIX), sizeof(MULTIPART_SUFFIX) - 1);
 }
 
 bool SttClient::sendDatasetRequest(WiFiClient& client,
@@ -479,15 +667,18 @@ int SttClient::readStatusCode(WiFiClient& client)
     return 0;
 }
 
-int SttClient::readResponseHeaders(WiFiClient& client, size_t& contentLength)
+int SttClient::readResponseHeaders(WiFiClient& client, HttpResponseHeaders& headers,
+                                  void (*onProgress)())
 {
-    contentLength = 0;
+    headers = {};
     const uint32_t startedAt = millis();
     while (!client.available())
     {
         if (millis() - startedAt >= HTTP_TIMEOUT_MS)
             return 0;
 
+        if (onProgress != nullptr)
+            onProgress();
         yield();
     }
 
@@ -499,6 +690,8 @@ int SttClient::readResponseHeaders(WiFiClient& client, size_t& contentLength)
     {
         if (!client.available())
         {
+            if (onProgress != nullptr)
+                onProgress();
             yield();
             continue;
         }
@@ -514,13 +707,25 @@ int SttClient::readResponseHeaders(WiFiClient& client, size_t& contentLength)
         String name = header.substring(0, separatorPosition);
         name.toLowerCase();
         if (name == "content-length")
-            contentLength = static_cast<size_t>(header.substring(separatorPosition + 1).toInt());
+            headers.contentLength = static_cast<size_t>(header.substring(separatorPosition + 1).toInt());
+        else if (name == "content-type")
+            headers.isWavResponse = header.substring(separatorPosition + 1).indexOf("audio/wav") >= 0;
+        else if (name == "x-rocky-interaction")
+        {
+            headers.interactionId = static_cast<uint32_t>(header.substring(separatorPosition + 1).toInt());
+            headers.hasInteractionId = true;
+        }
+        else if (name == "x-rocky-sequence")
+        {
+            headers.sequence = static_cast<uint32_t>(header.substring(separatorPosition + 1).toInt());
+            headers.hasSequence = true;
+        }
     }
 
     return 0;
 }
 
-String SttClient::readResponseBody(WiFiClient& client)
+String SttClient::readResponseBody(WiFiClient& client, void (*onProgress)())
 {
     String body;
     body.reserve(MAX_RESPONSE_BYTES);
@@ -539,6 +744,8 @@ String SttClient::readResponseBody(WiFiClient& client)
         if (millis() - startedAt >= HTTP_TIMEOUT_MS)
             break;
 
+        if (onProgress != nullptr)
+            onProgress();
         yield();
     }
 

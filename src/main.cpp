@@ -9,6 +9,7 @@
 #include "drivers/Speaker.h"
 #include "core/CommandProcessor.h"
 #include "core/TimeService.h"
+#include "core/InteractionLatency.h"
 #include "dataset/DatasetCollector.h"
 #include "audio/SpeechCapture.h"
 #include "audio/VoiceActivityDetector.h"
@@ -37,10 +38,11 @@ constexpr size_t MIC_BLOCK_SAMPLES = 64;
 constexpr uint32_t MIC_REPORT_INTERVAL_MS = 250;
 constexpr uint32_t HEALTH_CHECK_DELAY_MS = 500;
 constexpr uint32_t TIME_SCREEN_DURATION_MS = 3000;
-constexpr uint32_t COMMAND_WINDOW_DURATION_MS = 6000;
+constexpr uint32_t ATTENTION_TIMEOUT_MS = 6000;
 constexpr bool SERIAL_VERBOSE_AUDIO = false;
 constexpr bool MIC_DIAGNOSTIC_MODE = false;
 constexpr bool VAD_TRIGGER_DIAGNOSTICS = false;
+constexpr bool ATTENTION_VAD_DIAGNOSTICS = true;
 constexpr bool SPEAKER_TEST_TONE_ENABLED = false;
 constexpr uint32_t MIC_FRAME_DURATION_MS = MIC_BLOCK_SAMPLES * 1000UL / SpeechCapture::SAMPLE_RATE;
 constexpr uint32_t NOISE_WINDOW_MS = 750;
@@ -65,6 +67,107 @@ enum class DiagnosticCaptureMode : uint8_t
     Vad
 };
 
+class AttentionVadDiagnostics
+{
+public:
+    void setAttention(bool enabled, const VoiceActivityDetector& vad, uint32_t now)
+    {
+        attentionActive = enabled;
+        if (!enabled)
+            return;
+
+        resetInterval();
+        lastReportAt = now;
+        hasBlock = false;
+        updateSnapshot(vad);
+    }
+
+    void httpReturned(uint32_t now)
+    {
+        httpReturnedAt = now;
+        awaitingFirstBlock = true;
+    }
+
+    void emptyRead()
+    {
+        if (attentionActive)
+            ++emptyReads;
+    }
+
+    void observeBlock(const VoiceActivityDetector& vad, uint32_t now)
+    {
+        if (awaitingFirstBlock)
+        {
+            Serial.printf("[VAD DEBUG] resumed_i2s first_block_ms=%lu\n",
+                          static_cast<unsigned long>(now - httpReturnedAt));
+            awaitingFirstBlock = false;
+        }
+        if (!attentionActive)
+            return;
+
+        updateSnapshot(vad);
+        minimumRms = blocks == 0 ? rawRms : min(minimumRms, rawRms);
+        maximumRms = blocks == 0 ? rawRms : max(maximumRms, rawRms);
+        ++blocks;
+        if (rawRms > VoiceActivityDetector::THRESHOLD_OFF)
+            ++aboveEndBlocks;
+        lastBlockAt = now;
+        hasBlock = true;
+    }
+
+    void report(uint32_t now)
+    {
+        if (!attentionActive || now - lastReportAt < REPORT_INTERVAL_MS)
+            return;
+
+        // Snapshot do ultimo bloco: o timer nao avanca no log sem novas amostras.
+        Serial.printf("[VAD DEBUG] state=ATTENTION vad=%s raw_rms=%.0f blocks=%lu empty_reads=%lu "
+                      "rms_min=%.0f rms_max=%.0f above_end_blocks=%lu last_block_age_ms=%ld below_end_ms=%lu\n",
+                      vadState, rawRms, static_cast<unsigned long>(blocks),
+                      static_cast<unsigned long>(emptyReads), minimumRms, maximumRms,
+                      static_cast<unsigned long>(aboveEndBlocks),
+                      hasBlock ? static_cast<long>(now - lastBlockAt) : -1L,
+                      static_cast<unsigned long>(releaseElapsedMs));
+        lastReportAt = now;
+        resetInterval();
+    }
+
+private:
+    static constexpr uint32_t REPORT_INTERVAL_MS = 500;
+    bool attentionActive = false;
+    bool awaitingFirstBlock = false;
+    bool hasBlock = false;
+    uint32_t httpReturnedAt = 0;
+    uint32_t lastReportAt = 0;
+    uint32_t lastBlockAt = 0;
+    uint32_t blocks = 0;
+    uint32_t emptyReads = 0;
+    uint32_t aboveEndBlocks = 0;
+    uint32_t releaseElapsedMs = 0;
+    float rawRms = 0.0F;
+    float minimumRms = 0.0F;
+    float maximumRms = 0.0F;
+    const char* vadState = "UNKNOWN";
+
+    void updateSnapshot(const VoiceActivityDetector& vad)
+    {
+        rawRms = vad.getLevel();
+        vadState = vad.getStateName();
+        releaseElapsedMs = vad.getReleaseElapsedMs();
+    }
+
+    void resetInterval()
+    {
+        blocks = 0;
+        emptyReads = 0;
+        aboveEndBlocks = 0;
+        minimumRms = 0.0F;
+        maximumRms = 0.0F;
+    }
+};
+
+AttentionVadDiagnostics attentionVadDiagnostics;
+
 int32_t micSamples[MIC_BLOCK_SAMPLES];
 uint64_t micSumOfSquares = 0;
 int64_t micSum = 0;
@@ -73,9 +176,8 @@ uint32_t lastMicReportAt = 0;
 uint32_t wifiConnectedAt = 0;
 uint32_t timeScreenStartedAt = 0;
 uint32_t visualCommandWindowStartedAt = 0;
-uint32_t visualCommandWindowDurationMs = 0;
-uint32_t displayedCommandWindowSeconds = 0;
 uint32_t interactionId = 0;
+InteractionLatency interactionLatency;
 uint32_t calibrationId = 0;
 uint32_t calibrationDistanceCm = 0;
 uint32_t calibrationFirstActiveAt = 0;
@@ -101,7 +203,7 @@ bool timeSyncStarted = false;
 bool showingTime = false;
 bool backendConversationActive = false;
 bool visualCommandWindowActive = false;
-bool showingAttentionPrompt = false;
+bool capturedPostWakeCommand = false;
 InteractionState interactionState = InteractionState::Idle;
 Eyes::VisualState currentVisualState = Eyes::VisualState::Idle;
 
@@ -115,7 +217,6 @@ void updateTimeScreen(uint32_t now);
 void updateCommandWindow(uint32_t now);
 void returnToIdle();
 void setVisualState(Eyes::VisualState state, bool showConfirmation = true);
-void showAttentionPrompt(uint32_t secondsRemaining);
 void processDiagnosticSerial();
 void updateNoiseMeasurement(float rms);
 void updateCalibrationTrigger(float rms, uint32_t now);
@@ -180,6 +281,9 @@ bool reportCompletedSpeech()
 {
     if (!speechCapture.consumeCompleted())
         return false;
+
+    if constexpr (!MIC_DIAGNOSTIC_MODE)
+        interactionLatency.captureDone(speechCapture.wasLimited(), millis());
 
     const SpeechCapture::Pcm16Metrics& metrics = speechCapture.getMetrics();
 
@@ -494,15 +598,23 @@ void sendCompletedSpeech()
     if (!sttServerAvailable)
     {
         returnToIdle();
+        interactionLatency.finish();
         return;
     }
 
     reportCaptureMemory("before_stt");
     const uint32_t requestStartedAt = millis();
+    interactionLatency.requestStarted(requestStartedAt);
     const SttClient::PlaybackCallbacks playbackCallbacks{beginSpeaking, updateSpeakingVisual};
     SttClient::RealtimeResponse realtimeResponse;
-    if (sttClient.transcribeRealtime(speechCapture.getPcm16(), speechCapture.getPcmByteCount(), realtimeResponse))
+    const bool transcribed = sttClient.transcribeRealtime(speechCapture.getPcm16(),
+                                                        speechCapture.getPcmByteCount(), realtimeResponse,
+                                                        capturedPostWakeCommand);
+    if constexpr (ATTENTION_VAD_DIAGNOSTICS)
+        attentionVadDiagnostics.httpReturned(millis());
+    if (transcribed)
     {
+        interactionLatency.responseReceived(millis());
         Serial.printf("[STT] elapsed_ms=%lu\n",
                       static_cast<unsigned long>(millis() - requestStartedAt));
         reportCaptureMemory("before_backend_parse");
@@ -539,6 +651,7 @@ void sendCompletedSpeech()
     }
 
     reportCaptureMemory("after_stt");
+    interactionLatency.finish();
 }
 
 void beginSpeaking()
@@ -548,8 +661,8 @@ void beginSpeaking()
 
     interactionState = InteractionState::Speaking;
     visualCommandWindowActive = false;
-    showingAttentionPrompt = false;
     setVisualState(Eyes::VisualState::Speaking, false);
+    interactionLatency.playback(millis());
 }
 
 void updateSpeakingVisual()
@@ -580,7 +693,6 @@ void handleBackendResponse(const SttClient::BackendResponse& response, bool defe
         if (response.action.line1 == "Agora sao")
         {
             visualCommandWindowActive = false;
-            showingAttentionPrompt = false;
             display.showTime(response.action.line2);
             showingTime = true;
             interactionState = InteractionState::ShowingResponse;
@@ -598,25 +710,18 @@ void handleBackendResponse(const SttClient::BackendResponse& response, bool defe
     {
         interactionState = InteractionState::WaitingCommand;
         backendConversationActive = true;
-        if (response.commandWindowMs > 0)
-        {
-            visualCommandWindowActive = true;
-            visualCommandWindowStartedAt = millis();
-            visualCommandWindowDurationMs = response.commandWindowMs;
-            displayedCommandWindowSeconds = 0;
-            Serial.printf("[BACKEND] command_window_ms=%lu\n", static_cast<unsigned long>(response.commandWindowMs));
-            Serial.printf("[BODY] command window started: %lums\n",
-                          static_cast<unsigned long>(response.commandWindowMs));
-            showAttentionPrompt((response.commandWindowMs + 999) / 1000);
-        }
         setVisualState(Eyes::VisualState::Attention, false);
+        visualCommandWindowActive = true;
+        visualCommandWindowStartedAt = millis();
+        Serial.printf("[BODY] attention timeout started: %lums\n",
+                      static_cast<unsigned long>(ATTENTION_TIMEOUT_MS));
+        interactionLatency.attention(millis());
     }
     else if (response.interactionState == "idle")
     {
         interactionState = InteractionState::Idle;
         backendConversationActive = false;
         visualCommandWindowActive = false;
-        showingAttentionPrompt = false;
         if (!deferVisualState && !showingTime)
             setVisualState(Eyes::VisualState::Idle);
     }
@@ -708,35 +813,19 @@ void updateCommandWindow(uint32_t now)
         return;
 
     const uint32_t elapsedMs = now - visualCommandWindowStartedAt;
-    if (elapsedMs >= visualCommandWindowDurationMs)
+    // Uma fala iniciada na janela ainda precisa completar o attack do VAD.
+    if (elapsedMs >= ATTENTION_TIMEOUT_MS && !voiceActivityDetector.isStartingSpeech())
     {
-        visualCommandWindowActive = false;
-        showingAttentionPrompt = false;
-        Serial.println("[BODY] command window timeout");
-        setVisualState(Eyes::VisualState::Idle);
-        return;
+        Serial.println("[BODY] attention timeout");
+        returnToIdle();
     }
-
-    const uint32_t remainingMs = visualCommandWindowDurationMs - elapsedMs;
-    showAttentionPrompt((remainingMs + 999) / 1000);
-}
-
-void showAttentionPrompt(uint32_t secondsRemaining)
-{
-    if (showingAttentionPrompt && displayedCommandWindowSeconds == secondsRemaining)
-        return;
-
-    display.showAttentionPrompt(secondsRemaining);
-    showingAttentionPrompt = true;
-    displayedCommandWindowSeconds = secondsRemaining;
-    Serial.printf("[DISPLAY] attention prompt: %lus\n", static_cast<unsigned long>(secondsRemaining));
 }
 
 void returnToIdle()
 {
     interactionState = InteractionState::Idle;
-    showingAttentionPrompt = false;
     visualCommandWindowActive = false;
+    backendConversationActive = false;
     setVisualState(Eyes::VisualState::Idle);
 }
 
@@ -766,6 +855,9 @@ void setVisualState(Eyes::VisualState state, bool showConfirmation)
     const char* const previous = stateName(currentVisualState);
     const char* const next = stateName(state);
     currentVisualState = state;
+    if constexpr (ATTENTION_VAD_DIAGNOSTICS)
+        attentionVadDiagnostics.setAttention(state == Eyes::VisualState::Attention,
+                                            voiceActivityDetector, millis());
     animator.setVisualState(state, showConfirmation);
     Serial.printf("[STATE] %s -> %s\n", previous, next);
 }
@@ -773,7 +865,11 @@ void setVisualState(Eyes::VisualState state, bool showConfirmation)
 void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
 {
     if (sampleCount == 0)
+    {
+        if constexpr (ATTENTION_VAD_DIAGNOSTICS)
+            attentionVadDiagnostics.emptyRead();
         return;
+    }
 
     const float rms = calculateRms(samples, sampleCount);
     if constexpr (MIC_DIAGNOSTIC_MODE)
@@ -792,8 +888,11 @@ void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
     }
 
     accumulateMicrophoneSamples(samples, sampleCount);
+    const uint32_t frameAt = millis();
     speechCapture.pushSamples(samples, sampleCount);
     voiceActivityDetector.update(rms);
+    if constexpr (ATTENTION_VAD_DIAGNOSTICS)
+        attentionVadDiagnostics.observeBlock(voiceActivityDetector, millis());
 
     if (voiceActivityDetector.didSpeechStart())
     {
@@ -812,24 +911,33 @@ void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
         {
             ++interactionId;
             Serial.printf("\n[INTERACTION #%lu]\n", static_cast<unsigned long>(interactionId));
+            interactionLatency.begin(interactionId, frameAt);
         }
         reportCaptureMemory("before_capture");
+        capturedPostWakeCommand = !MIC_DIAGNOSTIC_MODE &&
+                                  interactionState == InteractionState::WaitingCommand;
+        Serial.printf("[BODY] capture_mode=%s\n", capturedPostWakeCommand ? "command" : "wake");
         speechCapture.start();
         if (visualCommandWindowActive)
         {
             visualCommandWindowActive = false;
-            showingAttentionPrompt = false;
-            Serial.println("[BODY] command window cancelled by speech");
+            Serial.println("[BODY] attention timeout cancelled by speech");
         }
         Serial.println("[VAD] SILENCE -> SPEECH");
         if (!MIC_DIAGNOSTIC_MODE && interactionState == InteractionState::WaitingCommand)
             interactionState = InteractionState::ProcessingCommand;
         if constexpr (!MIC_DIAGNOSTIC_MODE)
-            setVisualState(Eyes::VisualState::Listening);
+        {
+            // Wake e verificada passivamente; o personagem so reage apos confirmacao do backend.
+            if (capturedPostWakeCommand)
+                setVisualState(Eyes::VisualState::Listening);
+        }
     }
 
+    interactionLatency.observeLevel(rms, VoiceActivityDetector::THRESHOLD_OFF, frameAt);
     if (voiceActivityDetector.didSpeechEnd())
     {
+        interactionLatency.speechEnded(frameAt);
         speechCapture.finish();
         Serial.println("[VAD] SPEECH -> SILENCE");
         if constexpr (MIC_DIAGNOSTIC_MODE)
@@ -848,7 +956,8 @@ void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
             reportDiagnosticCapture();
         else
         {
-            setVisualState(Eyes::VisualState::Thinking, false);
+            if (capturedPostWakeCommand)
+                setVisualState(Eyes::VisualState::Thinking, false);
             sendCompletedSpeech();
         }
     }
@@ -936,6 +1045,7 @@ void loop()
         processDiagnosticSerial();
     else
         datasetCollector.update();
+    updateCommandWindow(millis());
     if (!showingTime && microphone.available())
         processMicrophoneSamples(micSamples, microphone.readSamples(micSamples, MIC_BLOCK_SAMPLES));
 
@@ -962,7 +1072,9 @@ void loop()
         timeService.update();
     updateTimeScreen(millis());
     updateCommandWindow(millis());
-    if (!showingTime && !showingAttentionPrompt)
+    if constexpr (ATTENTION_VAD_DIAGNOSTICS)
+        attentionVadDiagnostics.report(millis());
+    if (!showingTime)
         animator.update();
     reportMicrophoneLevel(millis());
 }

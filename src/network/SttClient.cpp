@@ -105,14 +105,15 @@ bool SttClient::checkHealth()
     return statusCode == 200 && isHealthyResponse(body);
 }
 
-bool SttClient::transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendResponse& response)
+bool SttClient::transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendResponse& response,
+                          bool postWakeCommand)
 {
     WiFiClient client;
     client.setTimeout(HTTP_TIMEOUT_MS);
 
     Serial.println("[STT] sending speech...");
     if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) ||
-        !sendMultipartRequest(client, pcm16, pcmByteCount))
+        !sendMultipartRequest(client, pcm16, pcmByteCount, postWakeCommand))
     {
         Serial.println("[STT] error=connection");
         client.stop();
@@ -138,12 +139,14 @@ bool SttClient::transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendRes
     return true;
 }
 
-bool SttClient::transcribeRealtime(const int16_t* pcm16, size_t pcmByteCount, RealtimeResponse& response)
+bool SttClient::transcribeRealtime(const int16_t* pcm16, size_t pcmByteCount, RealtimeResponse& response,
+                                  bool postWakeCommand)
 {
     response = {};
     WiFiClient client;
     client.setTimeout(HTTP_TIMEOUT_MS);
-    if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) || !sendRealtimeMultipartRequest(client, pcm16, pcmByteCount))
+    if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) ||
+        !sendRealtimeMultipartRequest(client, pcm16, pcmByteCount, postWakeCommand))
     {
         client.stop();
         return false;
@@ -480,7 +483,7 @@ bool SttClient::sendGetRequest(WiFiClient& client) const
 
 bool SttClient::sendMultipartRequest(WiFiClient& client,
                                      const int16_t* pcm16,
-                                     size_t pcmByteCount) const
+                                     size_t pcmByteCount, bool postWakeCommand) const
 {
     const size_t contentLength = sizeof(MULTIPART_PREFIX) - 1 + WAV_HEADER_SIZE + pcmByteCount +
                                  sizeof(MULTIPART_SUFFIX) - 1;
@@ -488,12 +491,14 @@ bool SttClient::sendMultipartRequest(WiFiClient& client,
         "POST /transcribe HTTP/1.1\r\n"
         "Host: %s:%u\r\n"
         "X-Rocky-Device: %s\r\n"
+        "X-Rocky-Interaction-Mode: %s\r\n"
         "Content-Type: multipart/form-data; boundary=%s\r\n"
         "Content-Length: %u\r\n"
         "Connection: close\r\n\r\n",
         STT_SERVER_HOST,
         STT_SERVER_PORT,
         DEVICE_ID,
+        postWakeCommand ? "command" : "wake",
         MULTIPART_BOUNDARY,
         static_cast<unsigned>(contentLength));
     if (headerWritten <= 0 ||
@@ -524,11 +529,12 @@ bool SttClient::sendMultipartRequest(WiFiClient& client,
 
 bool SttClient::sendRealtimeMultipartRequest(WiFiClient& client,
                                              const int16_t* pcm16,
-                                             size_t pcmByteCount) const
+                                             size_t pcmByteCount, bool postWakeCommand) const
 {
     const size_t contentLength = sizeof(MULTIPART_PREFIX) - 1 + WAV_HEADER_SIZE + pcmByteCount + sizeof(MULTIPART_SUFFIX) - 1;
-    if (client.printf("POST %s HTTP/1.1\r\nHost: %s:%u\r\nX-Rocky-Device: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
-                      REALTIME_TRANSCRIBE_PATH, STT_SERVER_HOST, STT_SERVER_PORT, DEVICE_ID, MULTIPART_BOUNDARY,
+    if (client.printf("POST %s HTTP/1.1\r\nHost: %s:%u\r\nX-Rocky-Device: %s\r\nX-Rocky-Interaction-Mode: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+                      REALTIME_TRANSCRIBE_PATH, STT_SERVER_HOST, STT_SERVER_PORT, DEVICE_ID,
+                      postWakeCommand ? "command" : "wake", MULTIPART_BOUNDARY,
                       static_cast<unsigned>(contentLength)) <= 0 ||
         !writeAll(client, reinterpret_cast<const uint8_t*>(MULTIPART_PREFIX), sizeof(MULTIPART_PREFIX) - 1))
         return false;

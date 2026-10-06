@@ -71,6 +71,11 @@ bool VoiceActivityDetector::isSpeaking() const
     return state == State::Speaking || state == State::SpeechEnding;
 }
 
+bool VoiceActivityDetector::isStartingSpeech() const
+{
+    return state == State::SpeechStarting;
+}
+
 bool VoiceActivityDetector::didSpeechStart()
 {
     const bool event = speechStarted;
@@ -88,4 +93,26 @@ bool VoiceActivityDetector::didSpeechEnd()
 float VoiceActivityDetector::getLevel() const
 {
     return level;
+}
+
+const char* VoiceActivityDetector::getStateName() const
+{
+    switch (state)
+    {
+    case State::Silence:
+        return "SILENCE";
+    case State::SpeechStarting:
+        return "SPEECH_STARTING";
+    case State::Speaking:
+        return "SPEECH";
+    case State::SpeechEnding:
+        return "SPEECH_ENDING";
+    }
+
+    return "UNKNOWN";
+}
+
+uint32_t VoiceActivityDetector::getReleaseElapsedMs() const
+{
+    return state == State::SpeechEnding ? millis() - stateStartedAt : 0;
 }

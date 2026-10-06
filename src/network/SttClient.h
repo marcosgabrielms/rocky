@@ -60,8 +60,10 @@ public:
     };
 
     bool checkHealth();
-    bool transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendResponse& response);
-    bool transcribeRealtime(const int16_t* pcm16, size_t pcmByteCount, RealtimeResponse& response);
+    bool transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendResponse& response,
+                    bool postWakeCommand = false);
+    bool transcribeRealtime(const int16_t* pcm16, size_t pcmByteCount, RealtimeResponse& response,
+                            bool postWakeCommand = false);
     bool playResponseAudio(Speaker& speaker, const PlaybackCallbacks& callbacks);
     bool playRealtimeInteraction(Speaker& speaker, uint32_t interactionId,
                                  const PlaybackCallbacks& callbacks);
@@ -96,10 +98,10 @@ private:
     bool sendGetRequest(WiFiClient& client) const;
     bool sendMultipartRequest(WiFiClient& client,
                               const int16_t* pcm16,
-                              size_t pcmByteCount) const;
+                              size_t pcmByteCount, bool postWakeCommand) const;
     bool sendRealtimeMultipartRequest(WiFiClient& client,
                                       const int16_t* pcm16,
-                                      size_t pcmByteCount) const;
+                                      size_t pcmByteCount, bool postWakeCommand) const;
     bool playAudioPath(Speaker& speaker, const String& path, const PlaybackCallbacks& callbacks);
     bool playWavResponse(Speaker& speaker, WiFiClient& client, size_t wavSize,
                          const PlaybackCallbacks& callbacks, const uint32_t* sequence = nullptr,

@@ -3,26 +3,32 @@
 import json
 import os
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from services.llm.base import ConversationMessage, LLMError, LLMResult
 from services.llm.personality import ROCKY_SYSTEM_PROMPT
+from services.latency import mark_latency
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "openrouter/free"
-ALLOWED_FREE_MODELS = frozenset({"openrouter/free", "openai/gpt-oss-20b:free"})
+DEFAULT_MODEL = "google/gemma-4-31b-it:free"
+ALLOWED_FREE_MODELS = frozenset({
+    DEFAULT_MODEL,
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "thinkingmachines/inkling-small:free",
+})
 REQUEST_TIMEOUT_SECONDS = 20
-MAX_RESPONSE_TOKENS = 160
+MAX_RESPONSE_TOKENS = 120
+RESPONSE_TEMPERATURE = 0.2
 
 
 class OpenRouterLLMClient:
     def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
         self._api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
-        self._model = model or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+        self._model = model if model is not None else os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
 
     def ask(self, message: str, context: Sequence[ConversationMessage] | None = None) -> LLMResult:
         self._validate_free_configuration()
@@ -46,7 +52,7 @@ class OpenRouterLLMClient:
         print("[LLM] response received")
         print(f"[LLM] elapsed_ms={elapsed_ms}")
         if result.model:
-            print(f"[LLM] response_model={result.model}")
+            self._log_routed_model(result.model)
         return result
 
     def stream_response(
@@ -56,6 +62,14 @@ class OpenRouterLLMClient:
         self._validate_free_configuration()
         request = self._build_request(message, context, stream=True)
         self._log_request(stream=True)
+        model_logged = False
+
+        def log_model(model: str) -> None:
+            nonlocal model_logged
+            if not model_logged:
+                mark_latency("routed_model_received")
+                self._log_routed_model(model)
+                model_logged = True
 
         try:
             with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
@@ -70,7 +84,7 @@ class OpenRouterLLMClient:
                         completed = True
                         break
 
-                    yield from self._parse_stream_event(data)
+                    yield from self._parse_stream_event(data, log_model)
 
                 if not completed:
                     raise LLMError("OpenRouter stream ended before completion")
@@ -86,8 +100,8 @@ class OpenRouterLLMClient:
         if not self._api_key:
             raise LLMError("OPENROUTER_API_KEY is not configured")
         if not self._is_explicitly_free_model(self._model):
-            print("[LLM] paid/non-approved model blocked")
-            raise LLMError("OpenRouter model is not explicitly free")
+            print("[LLM] model outside exact free allowlist blocked; no request sent")
+            raise LLMError("OpenRouter model is not explicitly free and locally approved")
 
     @staticmethod
     def _is_explicitly_free_model(model: str) -> bool:
@@ -100,6 +114,13 @@ class OpenRouterLLMClient:
             "model": self._model,
             "messages": self._build_messages(message, context),
             "max_tokens": MAX_RESPONSE_TOKENS,
+            "temperature": RESPONSE_TEMPERATURE,
+            "provider": {
+                "max_price": {"prompt": 0, "completion": 0},
+                "data_collection": "deny",
+                "allow_fallbacks": True,
+            },
+            "reasoning": self._reasoning_preferences(),
             "stream": stream,
         }
         return Request(
@@ -112,6 +133,13 @@ class OpenRouterLLMClient:
             },
             method="POST",
         )
+
+    def _reasoning_preferences(self) -> dict[str, Any]:
+        # Gemma permite desligar thinking; alternativas nao recebem effort nao confirmado.
+        preferences: dict[str, Any] = {"exclude": True}
+        if self._model == DEFAULT_MODEL:
+            preferences["enabled"] = False
+        return preferences
 
     def _log_request(self, stream: bool) -> None:
         print("[LLM] provider=openrouter")
@@ -145,7 +173,7 @@ class OpenRouterLLMClient:
         return LLMResult(text=content.strip(), model=model if isinstance(model, str) else None)
 
     @staticmethod
-    def _parse_stream_event(data: str) -> Iterator[str]:
+    def _parse_stream_event(data: str, on_model: Callable[[str], None] | None = None) -> Iterator[str]:
         try:
             payload: dict[str, Any] = json.loads(data)
         except json.JSONDecodeError as error:
@@ -153,6 +181,10 @@ class OpenRouterLLMClient:
 
         if "error" in payload:
             raise LLMError("OpenRouter returned a stream error")
+
+        model = payload.get("model")
+        if isinstance(model, str) and model and on_model is not None:
+            on_model(model)
 
         try:
             content = payload["choices"][0]["delta"].get("content")
@@ -165,3 +197,8 @@ class OpenRouterLLMClient:
             raise LLMError("OpenRouter returned an invalid stream fragment")
         if content:
             yield content
+
+    @staticmethod
+    def _log_routed_model(model: str) -> None:
+        preview = "".join(character for character in model[:160] if character.isprintable())
+        print(f"[LLM] routed_model={preview}")

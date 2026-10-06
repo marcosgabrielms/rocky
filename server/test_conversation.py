@@ -1,19 +1,23 @@
 """Testes determinísticos para wake word e contexto curto do Rocky."""
 
 import unittest
+import io
 from collections.abc import Sequence
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from services.commands import detect_command_intent, normalize_text
 from services.conversation import (
     CONTEXT_TTL_SECONDS,
     InteractionKind,
+    InteractionMode,
     LLM_INTERRUPTED_MESSAGE,
     LLM_UNAVAILABLE_MESSAGE,
     MAX_CONTEXT_MESSAGES,
     ConversationManager,
 )
 from services.llm import ConversationMessage, LLMError, LLMResult, OpenRouterLLMClient
+from services.latency import LatencyTrace, latency_scope
 
 
 class FakeClock:
@@ -54,7 +58,7 @@ class ConversationTest(unittest.TestCase):
         self.llm_client = FakeLLMClient()
         self.conversation = ConversationManager(10000, self.llm_client, clock=self.clock)
 
-    def wake(self, device_id: str = "rocky-01", text: str = "Ok, Rocky") -> dict[str, object]:
+    def wake(self, device_id: str = "rocky-01", text: str = "Koda") -> dict[str, object]:
         return self.conversation.build_response(text, device_id)
 
     def ask(self, text: str, device_id: str = "rocky-01") -> dict[str, object]:
@@ -73,19 +77,72 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(response["interaction_state"], "idle")
         self.assertEqual(response["actions"], [])
 
-    def test_accepts_ok_rocky_with_punctuation_and_spacing_variants(self) -> None:
-        for text in ("Ok, Rocky", "Ok Rocky", "Ok, Rocky!", "ok rocky"):
+    def test_accepts_koda_without_ok_and_with_punctuation(self) -> None:
+        for text in ("Koda", "Koda.", "Koda?", "koda", "KODA", "  Koda!  "):
             with self.subTest(text=text):
                 self.assert_wake(text)
 
-    def test_accepts_rocky_as_temporary_fallback(self) -> None:
-        self.assert_wake("Rocky")
+    def test_rejects_legacy_wake_and_similar_words(self) -> None:
+        for text in ("Rocky", "Ok Rocky", "Ok Koda", "Ei Koda", "alguma coisa", "Coda", "Kôda", "Calma",
+                     "Kodal", "Koda123", "Koda_nome", "Eu falei Koda ontem.", "O nome dele é Koda."):
+            with self.subTest(text=text):
+                self.assert_not_wake(text)
+
+    def test_same_utterance_hours_extracts_command_without_llm_or_attention(self) -> None:
+        for text in ("Koda, que horas são?", "KODA! Que horas são?", "Koda horas", "  \"Koda\", horas."):
+            with self.subTest(text=text), patch("services.conversation.get_current_time", return_value="12:00"):
+                decision = self.conversation.classify(text, "combined", interaction_mode=InteractionMode.WAKE)
+                response = self.conversation.build_response_from_decision(decision)
+                self.assertEqual(decision.kind, InteractionKind.DETERMINISTIC)
+                self.assertEqual(response["interaction_state"], "idle")
+                self.assertEqual(response["actions"][0]["line2"], "12:00")
+                self.assertFalse(self.conversation.has_active_command_window("combined"))
+                self.assertNotIn("combined", self.conversation._histories)
+        self.assertEqual(self.llm_client.calls, [])
+
+    def test_any_valid_question_after_koda_reaches_llm_once_without_wake_in_history(self) -> None:
+        questions = (
+            "Quem criou o Linux?", "Quem escreveu Dom Casmurro?", "Por que o céu é azul?",
+            "O que é fotossíntese?", "Quem foi Alan Turing?", "Qual é o maior planeta do Sistema Solar?",
+            "O que é recursão?", "Como funciona um eclipse?", "Por que o mar é salgado?",
+        )
+        for index, question in enumerate(questions):
+            with self.subTest(question=question):
+                device = f"question-{index}"
+                decision = self.conversation.classify(f"Koda, {question}", device, interaction_mode=InteractionMode.WAKE)
+                self.assertEqual(decision.kind, InteractionKind.LLM)
+                self.assertEqual(decision.text, question)
+                response = self.conversation.build_response_from_decision(decision)
+                self.assertEqual(len(self.llm_client.calls), index + 1)
+                self.assertEqual(self.llm_client.calls[-1][0], question)
+                self.assertEqual(response["interaction_state"], "idle")
+                self.assertEqual(self.conversation._histories[device].messages[0].content, question)
+
+    def test_same_utterance_streams_once_and_removes_only_initial_wake(self) -> None:
+        llm = StreamingFakeLLMClient(("Resposta curta.",))
+        manager = ConversationManager(0, llm, clock=self.clock)
+        result = manager.build_stream_response("Koda quem criou o Linux?", "combined-stream")
+        self.assertEqual(llm.stream_calls, [("quem criou o Linux?", ())])
+        self.assertEqual(llm.calls, [])
+        self.assertEqual(result.response["text"], "Resposta curta.")
+
+    def test_passive_idle_speech_does_not_invoke_llm_or_create_session(self) -> None:
+        for text in ("bom dia pessoal", "Ok Koda", "Eu falei Koda ontem", "Oi", "Kodal"):
+            response = self.conversation.build_response(text, "passive", interaction_mode=InteractionMode.WAKE)
+            self.assertEqual(response["interaction_state"], "idle")
+            self.assertEqual(response["actions"], [])
+            self.assertFalse(self.conversation.has_active_command_window("passive"))
+        self.assertEqual(self.llm_client.calls, [])
+
+    def test_inline_wake_does_not_bypass_mode_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            self.conversation.classify("Koda, pergunta", "invalid", interaction_mode="invalid")
 
     def test_rejects_ok_without_rocky(self) -> None:
         self.assert_not_wake("Ok")
 
     def test_rejects_common_phrase_with_rocky(self) -> None:
-        self.assert_not_wake("Onde está Rocky")
+        self.assert_not_wake("Onde está Koda")
 
     def test_classify_empty_returns_safe_direct_idle_response(self) -> None:
         decision = self.conversation.classify("", "empty")
@@ -95,18 +152,18 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(self.llm_client.calls, [])
 
     def test_classify_wake_opens_window_once_and_execution_does_not_reapply_it(self) -> None:
-        decision = self.conversation.classify("Ok, Rocky", "wake-once")
-        deadline_after_classification = self.conversation._deadlines["wake-once"]
+        decision = self.conversation.classify("Koda", "wake-once")
+        waiting_after_classification = set(self.conversation._waiting_commands)
 
         self.assertEqual(decision.kind, InteractionKind.WAKE)
         response = self.conversation.build_response_from_decision(decision)
 
         self.assertEqual(response["interaction_state"], "attention")
-        self.assertEqual(self.conversation._deadlines["wake-once"], deadline_after_classification)
+        self.assertEqual(self.conversation._waiting_commands, waiting_after_classification)
         self.assertEqual(self.llm_client.calls, [])
 
     def test_classify_deterministic_command_never_calls_llm(self) -> None:
-        self.conversation.classify("Ok, Rocky", "hours-decision")
+        self.conversation.classify("Koda", "hours-decision")
         with patch("services.conversation.get_current_time", return_value="12:00"):
             decision = self.conversation.classify("horas", "hours-decision")
             response = self.conversation.build_response_from_decision(decision)
@@ -128,7 +185,7 @@ class ConversationTest(unittest.TestCase):
             for streaming in (False, True):
                 with self.subTest(text=text, streaming=streaming):
                     self.assertEqual(detect_command_intent(normalize_text(text)), "hours")
-                    conversation.build_response("Ok, Rocky", "hours-variants")
+                    conversation.build_response("Koda", "hours-variants")
                     with patch("services.conversation.get_current_time", return_value="12:00"):
                         decision = conversation.classify(text, "hours-variants")
                     self.assertEqual(decision.kind, InteractionKind.DETERMINISTIC)
@@ -146,7 +203,7 @@ class ConversationTest(unittest.TestCase):
                 self.assertIsNone(detect_command_intent(normalize_text(text)))
 
     def test_llm_decision_is_executed_once_without_reclassification(self) -> None:
-        self.conversation.classify("Ok, Rocky", "one-llm")
+        self.conversation.classify("Koda", "one-llm")
         with patch.object(self.conversation, "classify", wraps=self.conversation.classify) as classify:
             decision = self.conversation.classify("Pergunta aberta", "one-llm")
             response = self.conversation.build_response_from_decision(decision)
@@ -159,7 +216,7 @@ class ConversationTest(unittest.TestCase):
     def test_stream_llm_decision_is_executed_once_without_reclassification(self) -> None:
         llm_client = StreamingFakeLLMClient(("Resposta.",))
         conversation = ConversationManager(10000, llm_client, clock=self.clock)
-        conversation.classify("Ok, Rocky", "one-stream")
+        conversation.classify("Koda", "one-stream")
         with patch.object(conversation, "classify", wraps=conversation.classify) as classify:
             decision = conversation.classify("Pergunta aberta", "one-stream")
             result = conversation.build_stream_response_from_decision(decision)
@@ -247,7 +304,7 @@ class ConversationTest(unittest.TestCase):
         llm_client = StreamingFakeLLMClient(("Olá. Como", " posso ajudar?"))
         conversation = ConversationManager(10000, llm_client, clock=self.clock)
 
-        conversation.build_stream_response("Ok, Rocky", "streaming-rocky")
+        conversation.build_stream_response("Koda", "streaming-rocky")
         result = conversation.build_stream_response("Me conte algo", "streaming-rocky")
 
         self.assertEqual(len(llm_client.stream_calls), 1)
@@ -263,7 +320,7 @@ class ConversationTest(unittest.TestCase):
                 llm_client = StreamingFakeLLMClient(error=LLMError(f"OpenRouter HTTP {status_code}"))
                 conversation = ConversationManager(10000, llm_client, clock=self.clock)
 
-                conversation.build_stream_response("Ok, Rocky", f"streaming-error-{status_code}")
+                conversation.build_stream_response("Koda", f"streaming-error-{status_code}")
                 result = conversation.build_stream_response("Pergunta", f"streaming-error-{status_code}")
 
                 self.assertEqual(len(llm_client.stream_calls), 1)
@@ -274,7 +331,7 @@ class ConversationTest(unittest.TestCase):
         llm_client = StreamingFakeLLMClient(("Resposta parcial"), LLMError("OpenRouter HTTP 429"))
         conversation = ConversationManager(10000, llm_client, clock=self.clock)
 
-        conversation.build_stream_response("Ok, Rocky", "streaming-partial")
+        conversation.build_stream_response("Koda", "streaming-partial")
         result = conversation.build_stream_response("Pergunta", "streaming-partial")
 
         self.assertEqual(len(llm_client.stream_calls), 1)
@@ -285,12 +342,144 @@ class ConversationTest(unittest.TestCase):
         llm_client = StreamingFakeLLMClient(("Não deve ser usado.",))
         conversation = ConversationManager(10000, llm_client, clock=self.clock)
 
-        conversation.build_stream_response("Ok, Rocky", "streaming-hours")
+        conversation.build_stream_response("Koda", "streaming-hours")
         with patch("services.conversation.get_current_time", return_value="12:00"):
             result = conversation.build_stream_response("horas", "streaming-hours")
 
         self.assertEqual(llm_client.stream_calls, [])
         self.assertEqual(result.response["actions"][0]["type"], "show_text")
+
+
+class FirmwareAttentionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = FakeClock()
+        monotonic_patch = patch("services.conversation.time.monotonic", side_effect=self.clock)
+        self.monotonic = monotonic_patch.start()
+        self.addCleanup(monotonic_patch.stop)
+        self.llm = FakeLLMClient()
+        self.manager = ConversationManager(10000, self.llm, clock=self.monotonic)
+
+    def wake(self, device_id: str = "koda-test") -> dict[str, object]:
+        return self.manager.build_response("Koda", device_id, interaction_mode=InteractionMode.WAKE)
+
+    def hours(self, received_at: float | None = None, device_id: str = "koda-test",
+              mode: InteractionMode = InteractionMode.COMMAND):
+        with patch("services.conversation.get_current_time", return_value="12:00"):
+            decision = self.manager.classify("Que horas são?", device_id,
+                                             received_at=received_at, interaction_mode=mode)
+        return decision, self.manager.build_response_from_decision(decision)
+
+    def assert_hours(self, decision, response) -> None:
+        self.assertEqual(decision.kind, InteractionKind.DETERMINISTIC)
+        self.assertEqual(response["actions"][0]["type"], "show_text")
+        self.assertEqual(response["actions"][0]["line2"], "12:00")
+        self.assertEqual(self.llm.calls, [])
+
+    def test_wake_returns_attention_without_backend_deadline(self) -> None:
+        response = self.wake()
+        self.assertEqual(response["interaction_state"], "attention")
+        self.assertNotIn("command_window_ms", response)
+        self.assertFalse(hasattr(self.manager, "_deadlines"))
+        self.assertTrue(self.manager.has_active_command_window("koda-test"))
+
+    def test_question_at_one_second_is_processed_without_timeout(self) -> None:
+        self.wake()
+        self.clock.now = 1.0
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertTrue(self.manager.has_active_command_window("koda-test"))
+            self.assert_hours(*self.hours())
+        self.assertIn("state=waiting_command", output.getvalue())
+        self.assertNotIn("timeout -> idle", output.getvalue())
+
+    def test_capture_started_at_five_point_nine_is_valid_after_slow_stt(self) -> None:
+        self.wake()
+        self.clock.now = 5.9
+        received_at = self.manager.capture_request_time()
+        self.clock.now = 50.0
+        self.assertTrue(self.manager.has_active_command_window("koda-test"))
+        self.assert_hours(*self.hours(received_at=received_at))
+
+    def test_firmware_timeout_returns_to_wake_mode_and_ignores_question(self) -> None:
+        self.wake()
+        self.clock.now = 6.001
+        output = io.StringIO()
+        with redirect_stdout(output):
+            decision, response = self.hours(mode=InteractionMode.WAKE)
+        self.assertEqual(decision.kind, InteractionKind.EMPTY)
+        self.assertEqual(response["interaction_state"], "idle")
+        self.assertNotIn("timeout -> idle", output.getvalue())
+        self.assertNotIn("koda-test", self.manager._waiting_commands)
+        self.assertEqual(self.llm.calls, [])
+
+    def test_new_request_trackers_do_not_invalidate_command_mode(self) -> None:
+        with latency_scope(clock=lambda: 50000.0):
+            self.wake()
+        self.clock.now = 1.0
+        tracker = LatencyTrace(clock=lambda: 0.0)
+        tracker.mark("stt_start")
+        with latency_scope(clock=lambda: 999999.0):
+            self.assertTrue(self.manager.has_active_command_window("koda-test"))
+            self.assert_hours(*self.hours())
+
+    def test_slow_stt_does_not_expire_a_command_received_within_window(self) -> None:
+        for arrival in (1.0, 5.9):
+            with self.subTest(arrival=arrival):
+                self.clock.now = 0.0
+                self.wake()
+                self.clock.now = arrival
+                received_at = self.manager.capture_request_time()
+                self.clock.now = 167.797
+                self.assertTrue(self.manager.has_active_command_window("koda-test"))
+                self.assertTrue(self.manager.has_active_command_window("koda-test", received_at=received_at))
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assert_hours(*self.hours(received_at=received_at))
+                self.assertNotIn("timeout -> idle", output.getvalue())
+
+    def test_command_mode_needs_no_second_wake_and_no_backend_clock(self) -> None:
+        self.wake()
+        self.clock.now = 500.0
+        with latency_scope(clock=lambda: 0.0):
+            self.assert_hours(*self.hours())
+
+    def test_command_windows_remain_separated_by_device_id(self) -> None:
+        self.wake("koda-a")
+        self.clock.now = 1.0
+        _, idle = self.hours(device_id="koda-b", mode=InteractionMode.WAKE)
+        self.assertEqual(idle["actions"], [])
+        self.assertTrue(self.manager.has_active_command_window("koda-a"))
+        self.clock.now = 5.0
+        self.wake("koda-b")
+        self.clock.now = 11.0
+        self.assertTrue(self.manager.has_active_command_window("koda-a"))
+        self.assertTrue(self.manager.has_active_command_window("koda-b"))
+        self.assert_hours(*self.hours(device_id="koda-b"))
+
+    def test_explicit_wake_mode_does_not_reuse_a_stale_session(self) -> None:
+        self.wake()
+        response = self.manager.build_response("Quem criou o Linux?", "koda-test",
+                                               interaction_mode=InteractionMode.WAKE)
+        self.assertEqual(response["actions"], [])
+        self.assertEqual(self.llm.calls, [])
+
+    def test_command_open_question_calls_llm_once(self) -> None:
+        self.wake()
+        self.clock.now = 60.0
+        response = self.manager.build_response("Quem criou o Linux?", "koda-test",
+                                               interaction_mode=InteractionMode.COMMAND)
+        self.assertTrue(response["text"])
+        self.assertEqual(len(self.llm.calls), 1)
+
+    def test_command_mode_treats_koda_as_command_instead_of_reopening_attention(self) -> None:
+        self.wake()
+        response = self.manager.build_response("Koda", "koda-test", interaction_mode=InteractionMode.COMMAND)
+        self.assertEqual(response["interaction_state"], "idle")
+        self.assertEqual(len(self.llm.calls), 1)
+
+    def test_invalid_mode_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.manager.classify("Pergunta", "koda-test", interaction_mode="invalid")
 
 
 if __name__ == "__main__":

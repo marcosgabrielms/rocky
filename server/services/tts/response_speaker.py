@@ -11,6 +11,8 @@ from threading import Lock
 
 from models.actions import BackendResponse
 from services.tts.base import TTSClient
+from services.latency import latency_metric, mark_latency
+from services.tts.speech_text import SpeechTextSanitizer, log_speech_text
 
 
 SUPPORTED_SAMPLE_RATE = 32000
@@ -69,10 +71,19 @@ class LocalResponseSpeaker:
         if spoken_text is None:
             return False
 
+        log_speech_text("TTS", "raw_sentence", 0, spoken_text)
+        spoken_text = SpeechTextSanitizer().sanitize(spoken_text)
+        log_speech_text("TTS", "sanitized_sentence", 0, spoken_text)
+        if not spoken_text:
+            return False
+
         try:
+            mark_latency("tts_start")
             with self._lock:
                 self._tts_client.synthesize_to_wav(spoken_text, self._output_path)
                 resample_wav(self._output_path, SUPPORTED_SAMPLE_RATE)
+                mark_latency("tts_ready")
+                latency_metric("tts_first_sentence_ms", "tts_start", "tts_ready")
                 print(f"[TTS] generated path={self._output_path.name} rate={SUPPORTED_SAMPLE_RATE}")
                 report_pcm_metrics(analyze_pcm_wav(self._output_path))
 
@@ -83,6 +94,8 @@ class LocalResponseSpeaker:
             return False
 
         print(f'[AUDIO] ready path={self._output_path.name}')
+        mark_latency("audio_available")
+        latency_metric("audio_ready_ms", "stt_start", "audio_available")
         return True
 
 

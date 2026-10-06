@@ -9,22 +9,22 @@ import time
 import wave
 from pathlib import Path
 from threading import Thread
+from contextvars import copy_context
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
-from services.conversation import ConversationManager, InteractionKind
+from services.conversation import ConversationManager, InteractionKind, InteractionMode
 from services.llm import OpenRouterLLMClient
 from services.realtime_audio import RealtimeAudioService
 from services.stt import SAMPLE_RATE, transcribe as transcribe_audio, validate_wav
 from services.tts import LocalResponseSpeaker, PiperTTS, RealtimeTTS, get_local_playback_enabled
 from services.audio_queue import AudioProductionStatus
+from services.latency import latency_metric, latency_scope, mark_latency, report_latency
 
 
 MAX_UPLOAD_BYTES = 1024 * 1024
 EXPECTED_CONTENT_TYPE = "audio/wav"
-COMMAND_WINDOW_MS = 10000
-DEFAULT_CONVERSATION_LLM_MODEL = "openrouter/free"
 DATASET_DIRECTORY = Path(__file__).parent / "dataset"
 CALIBRATION_DIRECTORY = Path(__file__).parent / "calibration"
 TTS_DIRECTORY = Path(__file__).parent / "local" / "tts"
@@ -35,8 +35,8 @@ REALTIME_LONG_POLL_MAX_MS = 1000
 REALTIME_LONG_POLL_INTERVAL_MS = 50
 
 app = FastAPI()
-llm_client = OpenRouterLLMClient(model=os.getenv("OPENROUTER_MODEL", DEFAULT_CONVERSATION_LLM_MODEL))
-conversation_manager = ConversationManager(COMMAND_WINDOW_MS, llm_client)
+llm_client = OpenRouterLLMClient()
+conversation_manager = ConversationManager(0, llm_client)
 response_speaker = LocalResponseSpeaker(
     PiperTTS(TTS_MODEL_PATH),
     TTS_OUTPUT_PATH,
@@ -57,17 +57,32 @@ def health() -> dict[str, str]:
 async def transcribe(
     file: UploadFile | None = File(default=None),
     x_rocky_device: str = Header(default="rocky-01"),
+    x_rocky_interaction_mode: InteractionMode | None = Header(default=None),
+) -> dict[str, object]:
+    received_at = conversation_manager.capture_request_time()
+    with latency_scope():
+        return await _transcribe(file, x_rocky_device, received_at, x_rocky_interaction_mode)
+
+
+async def _transcribe(
+    file: UploadFile | None, x_rocky_device: str, received_at: float,
+    interaction_mode: InteractionMode | None = None,
 ) -> dict[str, object]:
     audio_data = await read_wav_upload(file)
     duration_seconds = validate_wav(audio_data)
     print("[STT] request received")
     print(f"[STT] wav: {SAMPLE_RATE} Hz mono 16-bit duration={duration_seconds:.1f}s")
 
-    use_wake_hotword = not conversation_manager.has_active_command_window(x_rocky_device)
+    use_wake_hotword = _use_wake_hotword(x_rocky_device, interaction_mode)
     print(f"[STT] mode={'wake' if use_wake_hotword else 'command'}")
+    mark_latency("stt_start")
     text = transcribe_audio(audio_data, file.filename, use_wake_hotword)
+    mark_latency("stt_done")
+    latency_metric("stt_ms", "stt_start", "stt_done")
     print("[STT] transcription completed")
-    response = conversation_manager.build_response(text, x_rocky_device)
+    response = conversation_manager.build_response(
+        text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode
+    )
     response["audio_available"] = response_speaker.speak_response(response, text)
     return response
 
@@ -76,14 +91,29 @@ async def transcribe(
 async def transcribe_realtime(
     file: UploadFile | None = File(default=None),
     x_rocky_device: str = Header(default="rocky-01"),
+    x_rocky_interaction_mode: InteractionMode | None = Header(default=None),
+) -> dict[str, object]:
+    received_at = conversation_manager.capture_request_time()
+    with latency_scope():
+        return await _transcribe_realtime(file, x_rocky_device, received_at, x_rocky_interaction_mode)
+
+
+async def _transcribe_realtime(
+    file: UploadFile | None, x_rocky_device: str, received_at: float,
+    interaction_mode: InteractionMode | None = None,
 ) -> dict[str, object]:
     audio_data = await read_wav_upload(file)
     duration_seconds = validate_wav(audio_data)
     print("[RTD] request received")
     print(f"[RTD] wav duration={duration_seconds:.1f}s")
-    use_wake_hotword = not conversation_manager.has_active_command_window(x_rocky_device)
+    use_wake_hotword = _use_wake_hotword(x_rocky_device, interaction_mode)
+    mark_latency("stt_start")
     text = transcribe_audio(audio_data, file.filename, use_wake_hotword)
-    decision = conversation_manager.classify(text, x_rocky_device)
+    mark_latency("stt_done")
+    latency_metric("stt_ms", "stt_start", "stt_done")
+    decision = conversation_manager.classify(
+        text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode
+    )
     print(f"[RTD] classify kind={decision.kind}")
     if decision.kind is not InteractionKind.LLM:
         response = conversation_manager.build_response_from_decision(decision)
@@ -92,15 +122,13 @@ async def transcribe_realtime(
 
     interaction_id = realtime_audio_service.create_interaction()
     print(f"[RTD] interaction_created id={interaction_id}")
-    started_at = time.monotonic()
+    report_latency("interaction_id", interaction_id)
 
     def produce() -> None:
-        result = realtime_audio_service.build_stream_audio_response_from_decision(decision, interaction_id)
-        if result.audio_segments:
-            elapsed_ms = round((time.monotonic() - started_at) * 1000)
-            print(f"[RTD] first_audio_available_ms={elapsed_ms}")
+        realtime_audio_service.build_stream_audio_response_from_decision(decision, interaction_id)
 
-    Thread(target=produce, name=f"rocky-realtime-{interaction_id}", daemon=True).start()
+    request_context = copy_context()
+    Thread(target=lambda: request_context.run(produce), name=f"rocky-realtime-{interaction_id}", daemon=True).start()
     return {
         "realtime": True,
         "interaction_id": interaction_id,
@@ -109,6 +137,12 @@ async def transcribe_realtime(
         "actions": [],
         "audio_available": False,
     }
+
+
+def _use_wake_hotword(device_id: str, interaction_mode: InteractionMode | None) -> bool:
+    if interaction_mode is not None:
+        return interaction_mode == InteractionMode.WAKE
+    return not conversation_manager.has_active_command_window(device_id)
 
 
 @app.get("/realtime/audio/{interaction_id}/next")

@@ -96,7 +96,19 @@ class SttConfidenceTest(unittest.TestCase):
         self.assertEqual(text, "Rocky horas")
         self.assertTrue(model.calls[0]["vad_filter"])
         self.assertEqual(model.calls[0]["language"], "pt")
-        self.assertEqual(model.calls[0]["hotwords"], "Rocky")
+        self.assertEqual(model.calls[0]["hotwords"], "Koda")
+        self.assertEqual(model.calls[0]["beam_size"], 5)
+        self.assertEqual(model.calls[0]["best_of"], 5)
+        self.assertTrue(model.calls[0]["condition_on_previous_text"])
+        self.assertFalse(model.calls[0]["word_timestamps"])
+        self.assertIsNone(model.calls[0]["initial_prompt"])
+
+    def test_command_mode_has_no_wake_hint(self) -> None:
+        model = FakeModel([segment("horas", 0.1, -0.2)], 1.0)
+        with patch("services.stt.get_model", return_value=model):
+            text = stt.transcribe(b"audio", None, use_wake_hotword=False)
+        self.assertEqual(text, "horas")
+        self.assertIsNone(model.calls[0]["hotwords"])
 
 
 if __name__ == "__main__":

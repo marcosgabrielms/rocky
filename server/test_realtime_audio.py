@@ -1,9 +1,11 @@
 """Testes determinísticos da síntese incremental local por sentença."""
 
 import sys
+import io
 import types
 import unittest
 import wave
+from contextlib import redirect_stdout
 from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,9 +18,10 @@ if "piper" not in sys.modules:
 
 from services.audio_queue import AudioProductionStatus
 from services.conversation import ConversationManager, InteractionKind, LLM_UNAVAILABLE_MESSAGE
-from services.llm import ConversationMessage, LLMError, LLMResult
+from services.llm import ConversationMessage, LLMError, LLMResult, OpenRouterLLMClient
 from services.realtime_audio import RealtimeAudioService
 from services.tts.realtime import RealtimeTTS
+from services.latency import latency_scope
 
 
 class FakeClock:
@@ -64,6 +67,24 @@ class FakeTTS:
 
 
 class RealtimeAudioTest(unittest.TestCase):
+    def test_openrouter_reasoning_never_reaches_sentence_buffer_or_piper(self) -> None:
+        from test_realtime_streaming import FakeResponse
+
+        lines = (
+            b'data: {"choices":[{"delta":{"reasoning":"INTERNAL REASONING.","reasoning_details":[{"text":"NEVER SPEAK."}]}}]}\n',
+            b'data: {"choices":[{"delta":{"content":"**Linux** foi criado por Linus Torvalds."}}]}\n',
+            b'data: [DONE]\n',
+        )
+        llm = OpenRouterLLMClient(api_key="test-key", model="google/gemma-4-31b-it:free")
+        manager = ConversationManager(0, llm, clock=self.clock)
+        tts = FakeTTS()
+        service = RealtimeAudioService(manager, RealtimeTTS(tts, self.output_directory))
+        with patch("services.llm.openrouter.urlopen", return_value=FakeResponse(lines=lines)) as request:
+            result = service.build_stream_audio_response("Koda, quem criou o Linux?", "final-only")
+        request.assert_called_once()
+        self.assertEqual(tts.calls, ["Linux foi criado por Linus Torvalds."])
+        self.assertEqual(result.conversation.sentences, ("**Linux** foi criado por Linus Torvalds.",))
+
     def setUp(self) -> None:
         self._temporary_directory = TemporaryDirectory()
         self.output_directory = Path(self._temporary_directory.name) / "realtime"
@@ -82,7 +103,7 @@ class RealtimeAudioTest(unittest.TestCase):
 
     @staticmethod
     def wake(service: RealtimeAudioService, device_id: str) -> None:
-        service.build_stream_audio_response("Ok, Rocky", device_id)
+        service.build_stream_audio_response("Koda", device_id)
 
     def test_one_sentence_generates_one_ordered_segment(self) -> None:
         service, llm, tts = self.build_service(("Olá.",))
@@ -99,9 +120,70 @@ class RealtimeAudioTest(unittest.TestCase):
         self.assertGreater(result.audio_segments[0].duration_ms, 0)
         self.assertGreater(result.audio_segments[0].audio_bytes, 0)
 
+    def test_markdown_is_cleaned_before_fake_piper_without_changing_backend_text(self) -> None:
+        service, llm, tts = self.build_service(("**Linus Torvalds** criou o Linux.",))
+        self.wake(service, "markdown")
+        result = service.build_stream_audio_response("Quem criou o Linux?", "markdown")
+        self.assertEqual(tts.calls, ["Linus Torvalds criou o Linux."])
+        self.assertEqual(result.conversation.response["text"], "**Linus Torvalds** criou o Linux.")
+        self.assertEqual(llm.stream_calls, 1)
+
+    def test_skipped_code_sentence_keeps_audio_sequences_contiguous(self) -> None:
+        service, llm, tts = self.build_service(("```python\nprint('Codigo.')\n```.", " Resposta: Linux é livre."))
+        self.wake(service, "skip-code")
+        result = service.build_stream_audio_response("Pergunta", "skip-code")
+        self.assertEqual(tts.calls, ["Linux é livre."])
+        self.assertEqual([segment.sequence for segment in result.audio_segments], [0])
+        self.assertEqual(llm.stream_calls, 1)
+
+    def test_first_clean_sentence_is_synthesized_before_remaining_stream(self) -> None:
+        service, llm, tts = self.build_service(())
+        self.wake(service, "incremental-guard")
+
+        def chunks(*_args, **_kwargs):
+            llm.stream_calls += 1
+            yield "**Primeira**."
+            self.assertEqual(tts.calls, ["Primeira."])
+            yield " Segunda."
+
+        with patch.object(llm, "stream_response", side_effect=chunks):
+            service.build_stream_audio_response("Pergunta", "incremental-guard")
+        self.assertEqual(tts.calls, ["Primeira.", "Segunda."])
+
+    def test_only_code_or_url_produces_no_audio_without_retry(self) -> None:
+        for text in ("```python\nprint('Codigo.')\n```", "https://kernel.org"):
+            with self.subTest(text=text):
+                service, llm, tts = self.build_service((text,))
+                self.wake(service, "no-speech")
+                result = service.build_stream_audio_response("Pergunta", "no-speech")
+                self.assertEqual(tts.calls, [])
+                self.assertEqual(result.audio_segments, ())
+                self.assertFalse(result.tts_failed)
+                self.assertEqual(llm.stream_calls, 1)
+
+    def test_first_audio_timestamp_precedes_second_sentence_and_generation_end(self) -> None:
+        service, llm, _ = self.build_service(())
+        self.wake(service, "latency")
+        output = io.StringIO()
+
+        def chunks(*_args, **_kwargs):
+            llm.stream_calls += 1
+            yield "Primeira."
+            self.assertIn("kind=event audio_available_ms=", output.getvalue())
+            self.assertNotIn("llm_complete_ms=", output.getvalue())
+            yield "Segunda."
+
+        with patch.object(llm, "stream_response", side_effect=chunks), redirect_stdout(output), latency_scope():
+            result = service.build_stream_audio_response("Pergunta", "latency")
+
+        self.assertEqual(llm.stream_calls, 1)
+        self.assertEqual(len(result.audio_segments), 2)
+        self.assertEqual(output.getvalue().count("kind=event audio_available_ms="), 1)
+        self.assertIn("kind=duration tts_first_sentence_ms=", output.getvalue())
+
     def test_preclassified_llm_decision_is_not_classified_again(self) -> None:
         service, llm, _ = self.build_service(("Resposta.",))
-        service.build_stream_audio_response("Ok, Rocky", "preclassified")
+        service.build_stream_audio_response("Koda", "preclassified")
         decision = service._conversation_manager.classify("Pergunta", "preclassified")
 
         self.assertEqual(decision.kind, InteractionKind.LLM)
@@ -117,7 +199,7 @@ class RealtimeAudioTest(unittest.TestCase):
 
     def test_preclassified_wake_or_empty_never_starts_realtime_generation(self) -> None:
         service, llm, tts = self.build_service(("Não deve ser usado.",))
-        wake = service._conversation_manager.classify("Ok, Rocky", "safe-decision")
+        wake = service._conversation_manager.classify("Koda", "safe-decision")
         empty = service._conversation_manager.classify("", "empty-decision")
 
         wake_result = service.build_stream_audio_response_from_decision(wake)

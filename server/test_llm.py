@@ -32,9 +32,9 @@ def main() -> None:
     llm_client = CountingLLMClient(OpenRouterLLMClient())
     conversation = ConversationManager(10000, llm_client)
 
-    wake = conversation.build_response("Rocky", DEVICE_ID)
+    wake = conversation.build_response("Koda", DEVICE_ID)
     assert wake["interaction_state"] == "attention"
-    assert wake["command_window_ms"] == 10000
+    assert "command_window_ms" not in wake
     assert wake["actions"] == [{"type": "expression", "value": "attention"}]
     print("[TEST] wake=attention")
 
@@ -52,7 +52,7 @@ def main() -> None:
     assert llm_client.calls == 1
     print("[TEST] idle_question_llm_called=no")
 
-    hours_wake = conversation.build_response("Rocky", "hours-openrouter-test")
+    hours_wake = conversation.build_response("Koda", "hours-openrouter-test")
     assert hours_wake["interaction_state"] == "attention"
     hours = conversation.build_response("horas", "hours-openrouter-test")
     assert hours["interaction_state"] == "idle"

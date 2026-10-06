@@ -7,6 +7,8 @@ from functools import lru_cache
 from fastapi import HTTPException
 from faster_whisper import WhisperModel
 
+from services.latency import latency_metric, mark_latency
+
 
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH_BYTES = 2
@@ -17,6 +19,10 @@ COMPUTE_TYPE = "int8"
 NO_SPEECH_PROBABILITY_THRESHOLD = 0.6
 AVG_LOGPROB_THRESHOLD = -1.0
 STT_DIAGNOSTICS = False
+# Baseline explícito da API 1.2.1; mudar apenas após comparação de latência/qualidade.
+BEAM_SIZE = 5
+BEST_OF = 5
+CONDITION_ON_PREVIOUS_TEXT = True
 
 
 @lru_cache
@@ -57,13 +63,22 @@ def get_confident_text(segments: list[object], duration: float, duration_after_v
 def transcribe(audio_data: bytes, filename: str | None, use_wake_hotword: bool) -> str:
     audio_buffer = io.BytesIO(audio_data)
     audio_buffer.name = filename or "rocky.wav"
-    hotwords = "Rocky" if use_wake_hotword else None
+    hotwords = "Koda" if use_wake_hotword else None
     try:
-        segments, info = get_model().transcribe(
+        mark_latency("model_load_start")
+        model = get_model()
+        mark_latency("model_load_done")
+        latency_metric("model_load_ms", "model_load_start", "model_load_done")
+        segments, info = model.transcribe(
             audio_buffer,
             language="pt",
             hotwords=hotwords,
             vad_filter=True,
+            beam_size=BEAM_SIZE,
+            best_of=BEST_OF,
+            condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+            word_timestamps=False,
+            initial_prompt=None,
         )
         return get_confident_text(list(segments), info.duration, info.duration_after_vad)
     except RuntimeError as error:

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 import app
-from services.conversation import InteractionDecision, InteractionKind
+from services.conversation import ConversationManager, InteractionDecision, InteractionKind, InteractionMode
 from services.audio_queue import RealtimeAudioQueue
 from services.tts.realtime import RealtimeAudioSegment
 
@@ -29,12 +29,18 @@ class _ConversationDouble:
         self.response = response
         self.classify_calls = 0
         self.execute_calls = 0
+        self.received_at: float | None = None
 
-    def has_active_command_window(self, _device_id: str) -> bool:
+    def capture_request_time(self) -> float:
+        return 0.0
+
+    def has_active_command_window(self, _device_id: str, *, received_at: float | None = None) -> bool:
         return False
 
-    def classify(self, _text: str, _device_id: str) -> InteractionDecision:
+    def classify(self, _text: str, _device_id: str, *, received_at: float | None = None,
+                 interaction_mode: InteractionMode | None = None) -> InteractionDecision:
         self.classify_calls += 1
+        self.received_at = received_at
         return self.decision
 
     def build_response_from_decision(self, decision: InteractionDecision) -> dict[str, object]:
@@ -61,6 +67,41 @@ class _RealtimeAudioDouble:
 
 
 class RealtimeEndpointTest(TestCase):
+    def test_explicit_command_mode_survives_slow_stt_in_both_routes(self) -> None:
+        for endpoint in ("/transcribe", "/transcribe/realtime"):
+            with self.subTest(endpoint=endpoint):
+                clock = SimpleNamespace(now=0.0)
+                llm = SimpleNamespace(ask=lambda *_args, **_kwargs: self.fail("horas nao chama LLM"))
+                conversation = ConversationManager(0, llm, clock=lambda: clock.now)
+                conversation.build_response("Koda", "physical", interaction_mode=InteractionMode.WAKE)
+
+                def slow_stt(*_args):
+                    clock.now = 60.0
+                    return "Que horas são?"
+
+                with (
+                    patch.object(app, "conversation_manager", conversation),
+                    patch.object(app, "transcribe_audio", side_effect=slow_stt) as stt,
+                    patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+                    patch.object(app, "validate_wav", return_value=1.0),
+                    patch.object(app.response_speaker, "speak_response", return_value=False),
+                    patch("services.conversation.get_current_time", return_value="12:00"),
+                ):
+                    response = TestClient(app.app).post(
+                        endpoint, headers={"X-Rocky-Device": "physical", "X-Rocky-Interaction-Mode": "command"},
+                        files={"file": ("speech.wav", b"wav", "audio/wav")},
+                    )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["actions"][0]["line2"], "12:00")
+                self.assertFalse(stt.call_args.args[2])
+
+    def test_invalid_interaction_mode_is_rejected_before_stt(self) -> None:
+        with patch.object(app, "transcribe_audio") as stt:
+            response = TestClient(app.app).post("/transcribe/realtime",
+                                               headers={"X-Rocky-Interaction-Mode": "invalid"})
+        self.assertEqual(response.status_code, 422)
+        stt.assert_not_called()
+
     @staticmethod
     def queue_segment(directory: Path, sequence: int, text: str) -> RealtimeAudioSegment:
         path = directory / f"segment_{sequence}_{text}.wav"
@@ -101,12 +142,13 @@ class RealtimeEndpointTest(TestCase):
         self.assertIsNone(response.json()["interaction_id"])
         self.assertEqual(conversation.classify_calls, 1)
         self.assertEqual(conversation.execute_calls, 1)
+        self.assertEqual(conversation.received_at, 0.0)
         self.assertEqual(realtime_audio.create_calls, 0)
         self.assertEqual(realtime_audio.decisions, [])
 
     def test_wake_returns_sync_attention_without_interaction(self) -> None:
-        direct = {"text": "Ok, Rocky", "interaction_state": "attention", "actions": [{"type": "expression", "value": "attention"}]}
-        decision = InteractionDecision(InteractionKind.WAKE, "Ok, Rocky", "rocky-01", direct)
+        direct = {"text": "Koda", "interaction_state": "attention", "actions": [{"type": "expression", "value": "attention"}]}
+        decision = InteractionDecision(InteractionKind.WAKE, "Koda", "rocky-01", direct)
 
         response, conversation, realtime_audio = self.post_with_decision(decision, direct)
 

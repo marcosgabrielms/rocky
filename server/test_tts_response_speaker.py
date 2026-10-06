@@ -88,5 +88,16 @@ class ResponseSpeakerTest(unittest.TestCase):
 
         self.assertIsNone(get_spoken_text(response, "Pergunta em idle"))
 
+    def test_guard_preserves_original_text_but_cleans_piper_input(self) -> None:
+        response = {"text": "Resposta: **Linux** é livre.", "interaction_state": "idle", "actions": []}
+        self.assertTrue(self.speaker.speak_response(response, "Pergunta"))
+        self.assertEqual(self.tts_client.calls[0][0], "Linux é livre.")
+        self.assertEqual(response["text"], "Resposta: **Linux** é livre.")
+
+    def test_guard_does_not_synthesize_only_url(self) -> None:
+        response = {"text": "https://kernel.org", "interaction_state": "idle", "actions": []}
+        self.assertFalse(self.speaker.speak_response(response, "Pergunta"))
+        self.assertEqual(self.tts_client.calls, [])
+
 if __name__ == "__main__":
     unittest.main()

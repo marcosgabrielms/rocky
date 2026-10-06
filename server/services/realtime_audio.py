@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from services.audio_queue import RealtimeAudioQueue
 from services.conversation import ConversationManager, InteractionDecision, StreamedConversationResponse
 from services.tts.realtime import RealtimeAudioSegment, RealtimeTTS, RealtimeTTSSession
+from services.latency import latency_metric, mark_latency
+from services.tts.speech_text import SpeechTextSanitizer, log_speech_text
 
 
 @dataclass(frozen=True)
@@ -49,10 +51,17 @@ class RealtimeAudioService:
         session: RealtimeTTSSession | None = None
         segments: list[RealtimeAudioSegment] = []
         tts_failed = False
+        sanitizer = SpeechTextSanitizer()
 
         def synthesize_sentence(sentence: str, sequence: int, ready_ms: int) -> None:
             nonlocal interaction_id, session, tts_failed
             if tts_failed:
+                return
+
+            log_speech_text("LLM", "raw_sentence", sequence, sentence)
+            spoken_text = sanitizer.sanitize(sentence)
+            log_speech_text("TTS", "sanitized_sentence", sequence, spoken_text)
+            if not spoken_text:
                 return
 
             print(f"[RT] sentence_ready seq={sequence} ms={ready_ms}")
@@ -64,8 +73,13 @@ class RealtimeAudioService:
                     self._audio_queue.ready_audio_paths(),
                 )
             try:
-                segment = session.synthesize(sentence, sequence)
+                audio_sequence = len(segments)
+                segment = session.synthesize(spoken_text, audio_sequence)
                 self._audio_queue.enqueue(interaction_id, segment)
+                if audio_sequence == 0:
+                    mark_latency("audio_available")
+                    latency_metric("audio_ready_ms", "stt_start", "audio_available")
+                    latency_metric("first_audio_available_ms", "llm_request_start", "audio_available")
                 segments.append(segment)
             except Exception as error:
                 tts_failed = True

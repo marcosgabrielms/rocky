@@ -9,6 +9,7 @@ from threading import Lock
 
 from services.tts.base import TTSClient
 from services.tts.response_speaker import SUPPORTED_SAMPLE_RATE, resample_wav
+from services.latency import latency_metric, mark_latency
 
 
 @dataclass(frozen=True)
@@ -75,12 +76,17 @@ class RealtimeTTS:
         output_path = self._output_directory / f"{self._FILENAME_PREFIX}{interaction_id:04d}_{sequence:03d}.wav"
         started_at = time.monotonic()
         print(f"[RT] tts_start seq={sequence}")
+        if sequence == 0:
+            mark_latency("tts_start")
         with self._lock:
             self._tts_client.synthesize_to_wav(text, output_path)
             resample_wav(output_path, SUPPORTED_SAMPLE_RATE)
 
         elapsed_ms = round((time.monotonic() - started_at) * 1000)
         segment = self._read_segment(output_path, text, sequence)
+        if sequence == 0:
+            mark_latency("tts_ready")
+            latency_metric("tts_first_sentence_ms", "tts_start", "tts_ready")
         print(f"[RT] tts_ready seq={sequence} ms={elapsed_ms}")
         print(f"[RT] tts_duration_ms={segment.duration_ms}")
         print(f"[RT] audio_bytes={segment.audio_bytes}")

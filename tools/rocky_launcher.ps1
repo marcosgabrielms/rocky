@@ -34,7 +34,7 @@ if (-not $startApi) {
 }
 
 do {
-    $answer = Read-Host "Usar o modelo gratuito openrouter/free? [S/N]"
+    $answer = Read-Host "Usar o modelo gratuito google/gemma-4-31b-it:free? [S/N]"
     switch ($answer.Trim().ToUpperInvariant()) {
         "S" { $useRockyModel = $true }
         "N" { $useRockyModel = $false }
@@ -47,7 +47,7 @@ if (-not $useRockyModel) {
     exit 0
 }
 
-$env:OPENROUTER_MODEL = "openrouter/free"
+$env:OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
 $secureApiKey = Read-Host "Cole sua chave OpenRouter" -AsSecureString
 $apiKeyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureApiKey)
 try {

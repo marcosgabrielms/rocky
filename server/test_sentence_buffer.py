@@ -6,6 +6,27 @@ from services.llm import SentenceBuffer
 
 
 class SentenceBufferTest(unittest.TestCase):
+    def test_decimal_thousands_and_abbreviations_are_not_boundaries(self) -> None:
+        for text in ("Pi é 3.14 e custa 1.000 reais.", "O Sr. Silva chegou.",
+                     "A Sra. Silva chegou.", "O Dr. Silva chegou.", "A Dra. Silva chegou."):
+            with self.subTest(text=text):
+                buffer = SentenceBuffer()
+                self.assertEqual(buffer.push(text), (text,))
+
+    def test_numeric_period_split_across_chunks(self) -> None:
+        buffer = SentenceBuffer()
+        self.assertEqual(buffer.push("Pi é 3."), ())
+        self.assertEqual(buffer.push("14 e o Sr."), ())
+        self.assertEqual(buffer.push(" Silva tem 1."), ())
+        self.assertEqual(buffer.push("000 livros."), ("Pi é 3.14 e o Sr. Silva tem 1.000 livros.",))
+
+    def test_numeric_sentence_waits_for_lookahead_or_finish(self) -> None:
+        buffer = SentenceBuffer()
+        self.assertEqual(buffer.push("Resposta: 42."), ())
+        self.assertEqual(buffer.push(" Próxima."), ("Resposta: 42.", "Próxima."))
+        self.assertEqual(buffer.push("42."), ())
+        self.assertEqual(buffer.finish(), "42.")
+
     def test_emits_a_simple_complete_sentence(self) -> None:
         buffer = SentenceBuffer()
 

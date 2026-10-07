@@ -2,6 +2,8 @@
 
 import sys
 import io
+import json
+import os
 import types
 import unittest
 import wave
@@ -17,7 +19,7 @@ if "piper" not in sys.modules:
     sys.modules["piper"] = piper_module
 
 from services.audio_queue import AudioProductionStatus
-from services.conversation import ConversationManager, InteractionKind, LLM_UNAVAILABLE_MESSAGE
+from services.conversation import ConversationManager, InteractionKind, LLM_UNAVAILABLE_MESSAGE, LLM_INTERRUPTED_MESSAGE
 from services.llm import ConversationMessage, LLMError, LLMResult, OpenRouterLLMClient
 from services.realtime_audio import RealtimeAudioService
 from services.tts.realtime import RealtimeTTS
@@ -67,6 +69,64 @@ class FakeTTS:
 
 
 class RealtimeAudioTest(unittest.TestCase):
+    def test_default_ling_reaches_piper_with_contiguous_sequences_without_extra_request(self) -> None:
+        from test_realtime_streaming import FakeResponse
+        from services.llm.openrouter import DEFAULT_MODEL
+
+        self.assertEqual(DEFAULT_MODEL, "inclusionai/ling-3.1-flash")
+        events = (
+            {"reasoning": "NEVER SPEAK.", "reasoning_details": [{"text": "INTERNAL."}]},
+            {"content": "**Linux** foi criado por Linus Torvalds."},
+            {"content": " Ele nasceu na Finlândia."},
+        )
+        lines = tuple(("data: " + json.dumps({"model": DEFAULT_MODEL, "choices": [{"delta": delta}]}) + "\n").encode()
+                      for delta in events) + (b"data: [DONE]\n",)
+        with patch.dict(os.environ, {}, clear=True):
+            client = OpenRouterLLMClient(api_key="test-key")
+        tts = FakeTTS()
+        service = RealtimeAudioService(ConversationManager(0, client, clock=self.clock),
+                                       RealtimeTTS(tts, self.output_directory))
+        logs = io.StringIO()
+        with (patch("services.llm.openrouter.urlopen", return_value=FakeResponse(lines=lines)) as request,
+              redirect_stdout(logs)):
+            result = service.build_stream_audio_response("Koda, quem criou o Linux?", "default-ling")
+        request.assert_called_once()
+        payload = json.loads(request.call_args.args[0].data)
+        self.assertEqual(payload["model"], DEFAULT_MODEL)
+        self.assertNotIn("models", payload)
+        self.assertEqual(tts.calls, ["Linux foi criado por Linus Torvalds.", "Ele nasceu na Finlândia."])
+        self.assertEqual([segment.sequence for segment in result.audio_segments], [0, 1])
+        self.assertEqual(service.audio_queue.state(result.interaction_id).production_status, AudioProductionStatus.COMPLETED)
+        self.assertEqual(logs.getvalue().count(f"[LLM] routed_model={DEFAULT_MODEL}"), 1)
+
+    def test_default_ling_failure_produces_one_local_audio_and_failed_queue_without_gemma(self) -> None:
+        from urllib.error import HTTPError
+        from services.llm.openrouter import DEFAULT_MODEL
+
+        with patch.dict(os.environ, {}, clear=True):
+            client = OpenRouterLLMClient(api_key="test-key")
+        tts = FakeTTS()
+        service = RealtimeAudioService(ConversationManager(0, client, clock=self.clock),
+                                       RealtimeTTS(tts, self.output_directory))
+        error = HTTPError("https://example.test", 429, "failure", None,
+                          io.BytesIO(b'{"error":{"code":429,"message":"Rate limit exceeded"}}'))
+        with patch("services.llm.openrouter.urlopen", side_effect=error) as request:
+            result = service.build_stream_audio_response("Koda, quem criou o Linux?", "ling-failed")
+        request.assert_called_once()
+        payload = json.loads(request.call_args.args[0].data)
+        self.assertEqual(payload["model"], DEFAULT_MODEL)
+        self.assertNotIn("models", payload)
+        self.assertEqual(tts.calls, [LLM_UNAVAILABLE_MESSAGE])
+        self.assertEqual(result.conversation.response["text"], LLM_UNAVAILABLE_MESSAGE)
+        self.assertEqual(result.conversation.response["interaction_state"], "idle")
+        self.assertEqual([segment.sequence for segment in result.audio_segments], [0])
+        self.assertTrue(result.audio_segments[0].audio_path.exists())
+        self.assertEqual(service.audio_queue.state(result.interaction_id).production_status, AudioProductionStatus.FAILED)
+        item = service.audio_queue.next_item(result.interaction_id)
+        self.assertEqual(item.text, LLM_UNAVAILABLE_MESSAGE)
+        service.audio_queue.mark_consumed(result.interaction_id, item.sequence)
+        self.assertIsNone(service.audio_queue.next_item(result.interaction_id))
+
     def test_openrouter_reasoning_never_reaches_sentence_buffer_or_piper(self) -> None:
         from test_realtime_streaming import FakeResponse
 
@@ -238,14 +298,14 @@ class RealtimeAudioTest(unittest.TestCase):
         self.assertEqual(tts.calls, ["Resposta sem ponto"])
         self.assertEqual(result.conversation.sentences, ("Resposta sem ponto",))
 
-    def test_empty_chunks_do_not_synthesize_audio(self) -> None:
+    def test_empty_generation_synthesizes_only_local_failure_audio(self) -> None:
         service, _, tts = self.build_service(("", "  ", "\n"))
         self.wake(service, "empty")
 
         result = service.build_stream_audio_response("Pergunta", "empty")
 
-        self.assertEqual(tts.calls, [])
-        self.assertEqual(result.audio_segments, ())
+        self.assertEqual(tts.calls, [LLM_UNAVAILABLE_MESSAGE])
+        self.assertEqual(len(result.audio_segments), 1)
 
     def test_tts_failure_on_first_sentence_is_controlled(self) -> None:
         service, llm, tts = self.build_service(("Primeira. Segunda.",), fail_on_call=1)
@@ -280,23 +340,121 @@ class RealtimeAudioTest(unittest.TestCase):
         result = service.build_stream_audio_response("Pergunta", "partial-llm")
 
         self.assertEqual(llm.stream_calls, 1)
-        self.assertEqual(tts.calls, ["Resposta válida."])
-        self.assertEqual([segment.text for segment in result.audio_segments], ["Resposta válida."])
+        self.assertEqual(tts.calls, ["Resposta válida.", LLM_INTERRUPTED_MESSAGE])
+        self.assertEqual([segment.text for segment in result.audio_segments], ["Resposta válida.", LLM_INTERRUPTED_MESSAGE])
         self.assertIsNotNone(result.interaction_id)
         self.assertEqual(
             service.audio_queue.state(result.interaction_id).production_status,
             AudioProductionStatus.FAILED,
         )
 
-    def test_unavailable_free_model_produces_no_audio(self) -> None:
+    def test_unavailable_free_model_produces_one_local_error_audio(self) -> None:
         service, llm, tts = self.build_service((), LLMError("OpenRouter HTTP 429"))
         self.wake(service, "unavailable")
 
         result = service.build_stream_audio_response("Pergunta", "unavailable")
 
         self.assertEqual(llm.stream_calls, 1)
-        self.assertEqual(tts.calls, [])
+        self.assertEqual(tts.calls, [LLM_UNAVAILABLE_MESSAGE])
         self.assertEqual(result.conversation.response["text"], LLM_UNAVAILABLE_MESSAGE)
+        self.assertEqual(service.audio_queue.state(result.interaction_id).production_status, AudioProductionStatus.FAILED)
+
+    def test_unexpected_network_errors_finish_production_without_retry_or_secret_logs(self) -> None:
+        from http.client import IncompleteRead
+        from ssl import SSLError
+        for error in (ConnectionResetError("SECRET"), IncompleteRead(b"SECRET"),
+                      SSLError("SECRET"), RuntimeError("SECRET")):
+            with self.subTest(error=type(error).__name__):
+                service, llm, tts = self.build_service((), error)
+                self.wake(service, "network-error")
+                interaction_id = service.create_interaction()
+                logs = io.StringIO()
+                with redirect_stdout(logs):
+                    result = service.build_stream_audio_response("Pergunta", "network-error", interaction_id)
+                self.assertEqual(llm.stream_calls, 1)
+                self.assertEqual(tts.calls, [LLM_UNAVAILABLE_MESSAGE])
+                self.assertTrue(result.conversation.stream_failed)
+                self.assertEqual(service.audio_queue.state(interaction_id).production_status, AudioProductionStatus.FAILED)
+                self.assertNotIn("SECRET", logs.getvalue())
+
+    def test_session_setup_error_is_terminal(self) -> None:
+        service, _, _ = self.build_service(("Resposta.",))
+        self.wake(service, "setup-error")
+        interaction_id = service.create_interaction()
+        with patch.object(service._realtime_tts, "begin_interaction", side_effect=OSError("SECRET")):
+            result = service.build_stream_audio_response("Pergunta", "setup-error", interaction_id)
+        self.assertTrue(result.tts_failed)
+        self.assertEqual(service.audio_queue.state(interaction_id).production_status, AudioProductionStatus.FAILED)
+
+    def test_stream_deadline_produces_error_audio_and_failed_queue_without_retry(self) -> None:
+        from types import SimpleNamespace
+        from test_realtime_streaming import FakeResponse
+        clock = SimpleNamespace(now=0.0)
+
+        class KeepaliveResponse(FakeResponse):
+            def __iter__(self):
+                while True:
+                    clock.now += 61
+                    yield b": keepalive\n"
+
+        client = OpenRouterLLMClient(api_key="test-key", model="google/gemma-4-31b-it:free")
+        manager = ConversationManager(0, client, clock=self.clock)
+        tts = FakeTTS()
+        service = RealtimeAudioService(manager, RealtimeTTS(tts, self.output_directory))
+        with (patch("services.llm.openrouter.time.monotonic", side_effect=lambda: clock.now),
+              patch("services.llm.openrouter.Timer"),
+              patch("services.llm.openrouter.urlopen", return_value=KeepaliveResponse()) as request):
+            result = service.build_stream_audio_response("Koda, quem criou o Linux?", "deadline")
+        request.assert_called_once()
+        self.assertEqual(tts.calls, [LLM_UNAVAILABLE_MESSAGE])
+        self.assertEqual(service.audio_queue.state(result.interaction_id).production_status, AudioProductionStatus.FAILED)
+
+    def test_base_exception_propagates_but_queue_is_not_left_active(self) -> None:
+        for error in (KeyboardInterrupt(), SystemExit()):
+            with self.subTest(error=type(error).__name__):
+                service, _, _ = self.build_service((), error)
+                self.wake(service, "interrupt")
+                interaction_id = service.create_interaction()
+                with self.assertRaises(type(error)):
+                    service.build_stream_audio_response("Pergunta", "interrupt", interaction_id)
+                self.assertEqual(service.audio_queue.state(interaction_id).production_status, AudioProductionStatus.FAILED)
+
+    def test_partial_tts_artifact_is_removed_on_failure(self) -> None:
+        service, _, tts = self.build_service(("Resposta.",))
+        self.wake(service, "partial-file")
+
+        def fail(text, path):
+            path.write_bytes(b"partial wav")
+            raise OSError("falha simulada")
+
+        with patch.object(tts, "synthesize_to_wav", side_effect=fail):
+            result = service.build_stream_audio_response("Pergunta", "partial-file")
+        self.assertTrue(result.tts_failed)
+        self.assertEqual(list(self.output_directory.glob("rocky_rt_*.wav")), [])
+
+    def test_new_interaction_removes_old_orphan_but_preserves_recent_audio_and_models(self) -> None:
+        service, _, _ = self.build_service(())
+        self.output_directory.mkdir()
+        orphan = self.output_directory / "rocky_rt_9999_000.wav"
+        recent = self.output_directory / "rocky_rt_9999_001.wav"
+        model = self.output_directory / "pt_BR-jeff-medium.onnx"
+        orphan.write_bytes(b"old wav")
+        recent.write_bytes(b"new wav")
+        model.write_bytes(b"voice")
+        current = orphan.stat().st_mtime + 301
+        from types import SimpleNamespace
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == recent:
+                return SimpleNamespace(st_mtime=current)
+            return real_stat(path, *args, **kwargs)
+
+        with patch("services.tts.realtime.time.time", return_value=current), patch.object(Path, "stat", stat):
+            service.create_interaction()
+        self.assertFalse(orphan.exists())
+        self.assertTrue(recent.exists())
+        self.assertEqual(model.read_bytes(), b"voice")
 
     def test_hours_remains_deterministic_without_llm_or_incremental_tts(self) -> None:
         service, llm, tts = self.build_service(("Não deve ser usado.",))

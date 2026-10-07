@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from models.actions import BackendResponse, expression, show_text
-from services.tts.response_speaker import LocalResponseSpeaker, get_spoken_text
+from services.tts.response_speaker import LocalResponseSpeaker, get_spoken_text, get_local_playback_enabled
 
 
 class FakeTTSClient:
@@ -29,6 +29,14 @@ class FailingTTSClient:
 
 
 class ResponseSpeakerTest(unittest.TestCase):
+    def test_playback_defaults_off_outside_windows_and_flag_can_disable_windows(self) -> None:
+        with patch.dict("os.environ", {}, clear=True), patch("services.tts.response_speaker.os.name", "posix"):
+            self.assertFalse(get_local_playback_enabled())
+        with patch.dict("os.environ", {}, clear=True), patch("services.tts.response_speaker.os.name", "nt"):
+            self.assertTrue(get_local_playback_enabled())
+        with patch.dict("os.environ", {"ROCKY_LOCAL_TTS_PLAYBACK": "0"}), patch("services.tts.response_speaker.os.name", "nt"):
+            self.assertFalse(get_local_playback_enabled())
+
     def setUp(self) -> None:
         self._temporary_directory = TemporaryDirectory()
         self.output_path = Path(self._temporary_directory.name) / "rocky_response.wav"

@@ -13,6 +13,27 @@ from services.tts.speech_text import SpeechTextSanitizer, log_speech_text
 
 
 class SpeechTextTest(unittest.TestCase):
+    def test_think_and_numeric_answer_regressions(self) -> None:
+        sanitizer = SpeechTextSanitizer()
+        for raw, expected in (
+            ("<think>raciocinio interno</think> Paris.", "Paris."),
+            ("<THINK>segredo. Outra frase!</THINK> Paris.", "Paris."),
+            ("Paris. <think>segredo incompleto", "Paris."),
+            ("Resposta: 42.", "42."), ("42.", "42."),
+            ("1. Primeiro\n2. Segundo", "Primeiro Segundo"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(sanitizer.sanitize(raw), expected)
+
+    def test_think_split_in_stream_never_reaches_speech(self) -> None:
+        buffer = SentenceBuffer()
+        sanitizer = SpeechTextSanitizer()
+        spoken = []
+        for chunk in ("<thi", "nk>segredo. ", "Outro segredo!", "</thi", "nk> Resposta: 42."):
+            spoken.extend(sanitizer.sanitize(sentence) for sentence in buffer.push(chunk))
+        spoken.append(sanitizer.sanitize(buffer.finish()))
+        self.assertEqual([text for text in spoken if text], ["42."])
+
     def test_markdown_and_structural_labels(self) -> None:
         examples = (
             ("**Linus Torvalds** criou o Linux.", "Linus Torvalds criou o Linux."),
@@ -27,7 +48,7 @@ class SpeechTextTest(unittest.TestCase):
             ("Assistant: Linux. Output: Livre.", "Linux. Livre."),
             ("Analysis: Texto.\nAnswer: Resposta.", "Texto. Resposta."),
             ("Texto\n  Output: Resposta.", "Texto Resposta."),
-            ("Input: Output: Linux.", "Linux."), ("1.", ""),
+            ("Input: Output: Linux.", "Linux."), ("1.", "1."),
             ("O input do programa está errado.", "O input do programa está errado."),
             ("A palavra Output: aparece nesta frase.", "A palavra Output: aparece nesta frase."),
             ("```python\nprint('codigo.')\n```\nResposta.", "Resposta."),

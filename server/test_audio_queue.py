@@ -11,11 +11,49 @@ if "piper" not in sys.modules:
     piper_module.PiperVoice = object
     sys.modules["piper"] = piper_module
 
-from services.audio_queue import AudioItemStatus, AudioProductionStatus, RealtimeAudioQueue
+from services.audio_queue import AudioItemStatus, AudioProductionStatus, RealtimeAudioQueue, INTERACTION_MAXIMUM_AGE_SECONDS
 from services.tts.realtime import RealtimeAudioSegment
 
 
 class AudioQueueTest(unittest.TestCase):
+    def test_new_interaction_cleans_expired_terminal_and_orphaned_producer(self) -> None:
+        terminal = self.queue.create_interaction()
+        orphan = self.queue.create_interaction()
+        terminal_item = self.queue.enqueue(terminal, self.segment(0))
+        orphan_item = self.queue.enqueue(orphan, self.segment(0))
+        self.queue.mark_production_failed(terminal)
+        self.now += INTERACTION_MAXIMUM_AGE_SECONDS + 1
+        new = self.queue.create_interaction()
+        self.assertTrue(self.queue.has_interaction(new))
+        self.assertFalse(self.queue.has_interaction(terminal))
+        self.assertFalse(self.queue.has_interaction(orphan))
+        self.assertFalse(terminal_item.audio_path.exists())
+        self.assertFalse(orphan_item.audio_path.exists())
+        self.queue.finish_if_active(orphan, failed=True)
+
+    def test_finalization_is_idempotent_and_preserves_cancelled(self) -> None:
+        cancelled = self.queue.create_interaction()
+        done = self.queue.create_interaction()
+        self.queue.cancel(cancelled)
+        self.queue.finish_if_active(cancelled, failed=True)
+        self.queue.finish_if_active(done, failed=False)
+        self.queue.finish_if_active(done, failed=True)
+        self.assertEqual(self.queue.state(cancelled).production_status, AudioProductionStatus.CANCELLED)
+        self.assertEqual(self.queue.state(done).production_status, AudioProductionStatus.COMPLETED)
+
+    def test_cleanup_never_deletes_outside_controlled_directory(self) -> None:
+        from dataclasses import replace
+        with TemporaryDirectory() as outside:
+            path = Path(outside) / "preserve.wav"
+            path.write_bytes(b"preserve")
+            interaction = self.queue.create_interaction()
+            self.queue.enqueue(interaction, replace(self.segment(0), audio_path=path))
+            self.queue.mark_production_done(interaction)
+            self.now += 301
+            with self.assertRaises(ValueError):
+                self.queue.cleanup_expired(300)
+            self.assertEqual(path.read_bytes(), b"preserve")
+
     def setUp(self) -> None:
         self._temporary_directory = TemporaryDirectory()
         self.directory = Path(self._temporary_directory.name)

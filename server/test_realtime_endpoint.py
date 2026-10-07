@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -53,6 +53,7 @@ class _RealtimeAudioDouble:
     def __init__(self) -> None:
         self.create_calls = 0
         self.decisions: list[InteractionDecision] = []
+        self.audio_queue = Mock(spec=RealtimeAudioQueue)
 
     def create_interaction(self) -> int:
         self.create_calls += 1
@@ -67,6 +68,65 @@ class _RealtimeAudioDouble:
 
 
 class RealtimeEndpointTest(TestCase):
+    def test_health_works_without_llm_key(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            response = TestClient(app.app).get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_thread_start_and_escaped_producer_errors_are_terminal(self) -> None:
+        from services.audio_queue import AudioProductionStatus
+        for thread_start_error in (False, True):
+            with self.subTest(thread_start_error=thread_start_error), TemporaryDirectory() as directory:
+                queue = RealtimeAudioQueue(Path(directory))
+                producer = Mock(side_effect=ConnectionResetError("SECRET"))
+                service = SimpleNamespace(audio_queue=queue, create_interaction=queue.create_interaction,
+                                          build_stream_audio_response_from_decision=producer)
+                decision = InteractionDecision(InteractionKind.LLM, "Pergunta", "test")
+                conversation = _ConversationDouble(decision, {})
+                thread = Mock()
+                thread.return_value.start.side_effect = RuntimeError("SECRET")
+                with (patch.object(app, "realtime_audio_service", service),
+                      patch.object(app, "conversation_manager", conversation),
+                      patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+                      patch.object(app, "validate_wav", return_value=1.0),
+                      patch.object(app, "transcribe_audio", return_value="Pergunta"),
+                      patch.object(app, "Thread", thread if thread_start_error else _ImmediateThread)):
+                    response = TestClient(app.app).post("/transcribe/realtime",
+                        files={"file": ("speech.wav", b"wav", "audio/wav")})
+                    interaction_id = response.json()["interaction_id"]
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(queue.state(interaction_id).production_status, AudioProductionStatus.FAILED)
+                    self.assertEqual(TestClient(app.app).get(f"/realtime/audio/{interaction_id}/next").json(), {"status": "failed"})
+
+    def test_llm_failure_serves_local_error_wav_then_failed_after_ack(self) -> None:
+        from services.llm import LLMError
+        from services.realtime_audio import RealtimeAudioService
+        from services.tts.realtime import RealtimeTTS
+        from test_realtime_audio import FakeTTS, StreamingLLM
+        with TemporaryDirectory() as directory:
+            llm = StreamingLLM((), LLMError("OpenRouter HTTP 429"))
+            conversation = ConversationManager(0, llm)
+            tts = FakeTTS()
+            service = RealtimeAudioService(conversation, RealtimeTTS(tts, Path(directory)))
+            with (patch.object(app, "conversation_manager", conversation),
+                  patch.object(app, "realtime_audio_service", service),
+                  patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+                  patch.object(app, "validate_wav", return_value=1.0),
+                  patch.object(app, "transcribe_audio", return_value="Koda, uma pergunta?"),
+                  patch.object(app, "Thread", _ImmediateThread)):
+                client = TestClient(app.app)
+                response = client.post("/transcribe/realtime", files={"file": ("speech.wav", b"wav", "audio/wav")})
+                interaction_id = response.json()["interaction_id"]
+                audio = client.get(f"/realtime/audio/{interaction_id}/next")
+                self.assertEqual(audio.status_code, 200)
+                self.assertEqual(audio.content[:4], b"RIFF")
+                self.assertEqual(audio.headers["x-rocky-sequence"], "0")
+                self.assertEqual(client.post(f"/realtime/audio/{interaction_id}/0/consumed").status_code, 200)
+                self.assertEqual(client.get(f"/realtime/audio/{interaction_id}/next").json(), {"status": "failed"})
+            self.assertEqual(llm.stream_calls, 1)
+            self.assertEqual(len(tts.calls), 1)
+
     def test_explicit_command_mode_survives_slow_stt_in_both_routes(self) -> None:
         for endpoint in ("/transcribe", "/transcribe/realtime"):
             with self.subTest(endpoint=endpoint):

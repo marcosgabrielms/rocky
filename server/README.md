@@ -6,12 +6,75 @@ WAV é salvo em disco e não há API key ou serviço pago.
 
 ## Preparação no Windows PowerShell
 
+Runtime oficial: **Python 3.12.10 x64** (`.python-version`). Não usar o Python
+interno do PlatformIO nem migrar para 3.13/3.14: o resampling usa `audioop`,
+removido em 3.13, e `StrEnum` exige pelo menos 3.11. O playback local usa
+`winsound` somente quando habilitado; por padrão fica desligado fora do Windows.
+`ROCKY_LOCAL_TTS_PLAYBACK=0` continua desativando a reprodução no PC Windows.
+
 ```powershell
 cd server
-py -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+`requirements.txt` fixa as versões diretas e aplica `requirements-lock.txt`
+como constraints das dependências transitivas do ambiente validado. Para testes
+HTTP, instalar `requirements-dev.txt` (mesmas dependências mais `httpx`).
+Somente `.venv` é descartável; modelos locais, `.env` e WAVs não fazem parte dela.
+O ambiente virtual continua ignorado pelo Git. Nenhum segredo entra nos manifests.
+
+## Estabilização pós-auditoria
+
+- Cada produtor realtime termina como `completed`, `failed` ou `cancelled`.
+  A finalização é idempotente e cobre exceções de rede, inicialização da síntese
+  e início da thread; `KeyboardInterrupt`/`SystemExit` não são engolidos.
+- `STREAM_DEADLINE_SECONDS=120` é o deadline absoluto da geração SSE, separado
+  do timeout de socket/leitura de 20 s. Um timer por stream encerra o socket
+  se até uma linha SSE ficar presa; o timer é cancelado ao sair. Zero retry,
+  uma chamada OpenRouter por pergunta, mesmos modelos e política gratuita.
+- `REALTIME_TOTAL_DEADLINE_MS=180000` limita o polling do ESP32, inclusive
+  espera por headers, download e ACK. O HTTP individual permanece em 60000 ms.
+  Ao expirar, imprime `[RT] total deadline exceeded`; o caminho já existente
+  em `main.cpp` retorna a IDLE. A checagem durante playback acontece entre
+  blocos PCM, sem mudar volume, sample rate ou driver do speaker.
+- Falha antes de áudio útil sintetiza uma mensagem local de indisponibilidade.
+  Se já houve áudio útil, adiciona uma única mensagem de resposta interrompida.
+  Esses WAVs ficam disponíveis na fila antes do status `failed`, sem nova LLM.
+  Se Piper também falhar, finaliza sem áudio e o firmware retorna a IDLE.
+- Nova interação limpa as anteriores sem progresso por 300 s, inclusive
+  produtores órfãos e WAVs pendentes, somente no diretório realtime protegido.
+  Não há scheduler. WAV parcial de síntese com erro também é removido.
+  WAVs órfãos sem referência na fila são limpos na criação de nova interação
+  após 300 s de idade; WAVs recentes e modelos são preservados. Isso evita
+  apagar um segmento que outro produtor acabou de gerar antes do enqueue.
+- `SentenceBuffer` preserva decimais/milhares e `Sr./Sra./Dr./Dra.`. Um ponto
+  numérico no final do chunk aguarda lookahead ou fim do stream. `<think>`
+  permanece agrupado até poder ser removido pelo sanitizer, inclusive em chunks.
+  Respostas numéricas como `Resposta: 42.` e `42.` continuam faláveis.
+- Uma instância lazy de `PiperTTS`, protegida por lock, atende os dois caminhos.
+  Whisper (`get_model`, cache) e Piper (`_get_voice`) ainda carregam no primeiro
+  uso; nenhum warm-up foi adicionado sem medição de cold start.
+
+Validação automatizada (sem LLM/Whisper/Piper reais ou playback):
+
+```powershell
+cd server
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m unittest discover -p "test_*.py"
+.\.venv\Scripts\python.exe -m compileall -q app.py models services
+```
+
+Teste físico posterior, com flash manual: fala comum deve manter IDLE; `Koda`
+deve abrir Attention por 6 s; testar `Koda, que horas são?` e `Koda, quem criou
+o Linux?`. Em seguida simular backend indisponível e interrupção da rede durante
+a resposta. Confirmar mensagem local quando o transporte/Piper permitir e retorno
+controlado a IDLE em erro, sem espera infinita. Validação física não concluída.
+
+Pendências fora desta rodada: resiliência Wi-Fi/backend no boot, autenticação,
+user_id/device_id, contrato versionado, prova/limpeza de legado, refatoração de
+main.cpp, Koda Central, Android, wake local/KWS, LLM local e movimento.
 
 ## Iniciar
 
@@ -108,8 +171,8 @@ backend. Não há log por amostra ou por frame no firmware.
 
 1. Usar o mesmo ambiente, ventilador desligado e distância fixa (40–60 cm).
    Fechar o Serial Monitor antes do flash **manual** do firmware compilado.
-2. Reiniciar a API com o ambiente Python válido e o launcher existente, mantendo
-   google/gemma-4-31b-it:free. Não expor a API fora da LAN nem colocar chaves nos logs.
+2. Reiniciar a API com o ambiente Python válido e o launcher existente, usando
+   a politica de custo zero descrita abaixo. Não expor a API fora da LAN nem colocar chaves nos logs.
 3. Abrir COM3 em 115200 baud e guardar tanto o Serial quanto os logs do backend.
 4. Cenário A: dizer apenas **Koda** cinco vezes; esperar Attention e o timeout
    de cada sessão antes de repetir. Registrar reconhecimento/falha,
@@ -121,7 +184,7 @@ backend. Não há log por amostra ou por frame no firmware.
    Repetir cinco vezes: stt_ms, llm_first_token_ms, first_sentence_ms,
    tts_first_sentence_ms, speech_end_to_playback_start_ms e routed_model,
    quando informado pelo próprio SSE (sem request extra). Cada pergunta pode
-   fazer somente uma chamada ao modelo gratuito.
+   fazer somente uma chamada HTTP ao OpenRouter, com os modelos free aprovados.
 7. Separar a primeira chamada fria (model_load_ms), falhas e capturas por limite.
    Comparar medianas e amplitude min/max com um baseline nas mesmas condições.
    Não alegar ganho antes dessa coleta, nem comparar novos nomes com áudio
@@ -167,8 +230,9 @@ continua contigua, com o mesmo protocolo de ACK e AudioQueue.
 
 O prompt orienta uma frase curta para perguntas simples e no maximo duas para
 explicacoes comuns; mais detalhes somente quando pedidos. A politica atual usa
-`max_tokens=120`, `temperature=0.2` e Gemma free fixo, sem fallback de modelo,
-retry ou chamada extra de resumo. O modelo roteado vem da propria resposta/SSE.
+`max_tokens=120`, `temperature=0.2` e Ling 3.1 Flash como unico modelo padrao,
+sem fallback automatico entre modelos, retry Python ou chamada extra de resumo. O modelo roteado vem
+da propria resposta/SSE.
 Logs temporarios de texto usam `SPEECH_TEXT_DIAGNOSTICS` e previews limitados
 a 240 caracteres; nao incluem chave, tokens de autenticacao ou dados PCM.
 
@@ -185,7 +249,7 @@ Koda -> pergunta iniciada perto de 5,9 s -> captura command, sem expirar no STT;
 Koda -> Que horas sao? -> comando deterministico sem LLM;
 Koda -> Quem criou o Linux? -> resposta curta, sem Markdown/metatexto no audio.
 
-### Modelo fixo, custo zero e wake passiva (politica atual)
+### Modelo padrao, custo zero e wake passiva (politica atual)
 
 A unica wake e `Koda` (caixa/pontuacao), pronunciada Kôda. `Ok Koda`, `Ei Koda`,
 `Coda`, `Kodal`, `Rocky` e Koda no meio de uma frase nao ativam em Idle.
@@ -201,43 +265,82 @@ token significativo precisa ser exatamente Koda; nao ha fuzzy/substring nem
 whitelist de perguntas. Qualquer pergunta valida pos-wake segue ao LLM se nao
 for comando conhecido. O prefixo de wake nao entra no contexto de conversa.
 
-Configuracao manual existente: `OPENROUTER_MODEL`. Allowlist local exata:
+Sem `OPENROUTER_MODEL`, o unico modelo padrao e `inclusionai/ling-3.1-flash`.
+Gemma (`google/gemma-4-31b-it:free`) permanece na allowlist apenas como
+alternativa manual para diagnostico. Os probes reais observaram HTTP 429 no
+Google AI Studio; ele nao e default nem fallback automatico do Ling.
 
-- `google/gemma-4-31b-it:free` — padrao;
-- `nvidia/nemotron-3-super-120b-a12b:free` — alternativa manual;
-- `thinkingmachines/inkling-small:free` — somente selecao manual, nunca automatica.
+Ling 3.1 Flash atualmente tem entrada e saida gratuitas, mesmo sem `:free` no
+slug. Isso nao garante gratuidade futura: `max_price=0` preserva custo zero e
+impede o uso de endpoints que passem a cobrar. A privacidade continua protegida
+por `data_collection=deny`.
 
 `openrouter/free`, `openrouter/auto`, modelos pagos, outros `:free` e configuracao
-vazia sao bloqueados antes da request. A composicao de app.py usa o mesmo default
-do cliente, sem duplicar configuracao. O launcher pergunta pelo Gemma e o define
-apenas no processo atual; para avaliar alternativas manualmente, configure a
+vazia sao bloqueados antes da request. `OPENROUTER_MODEL` continua sendo um
+override manual de UM dos dois modelos autorizados: somente ele e enviado,
+sem fallback entre modelos. O launcher pergunta pelo Ling com preco maximo zero e remove o override apenas
+do processo atual; para selecionar um unico modelo manualmente, configure a
 variavel no PowerShell e inicie Uvicorn diretamente com o ambiente restaurado.
+Nao ha configuracao persistente ou leitura de .env no launcher.
 
-Cada request envia um unico `model`, `temperature=0.2`, `max_tokens=120` e:
+A request padrao usa somente o campo singular `model`, nunca `models`, e inclui:
 
 ```json
-{"provider":{"max_price":{"prompt":0,"completion":0},"data_collection":"deny","allow_fallbacks":true}}
+{
+  "model": "inclusionai/ling-3.1-flash",
+  "stream": true,
+  "temperature": 0.2,
+  "max_tokens": 120,
+  "provider": {
+    "max_price": {"prompt": 0, "completion": 0},
+    "data_collection": "deny",
+    "allow_fallbacks": true
+  },
+  "reasoning": {"exclude": true}
+}
 ```
 
-Sem lista `models`, retries ou segunda geracao. `allow_fallbacks=true` permite
-somente providers do mesmo modelo; nenhum provider e fixado por nome. Se nao
-houver endpoint gratuito compativel com a privacidade, a falha e local/controlada,
-sem relaxar as restricoes. Inkling informa coleta de prompts/outputs, por isso
-nao e default e pode ficar indisponivel com `data_collection=deny`.
+Uma pergunta aberta faz exatamente UMA chamada HTTP Python ao OpenRouter.
+Nao ha loop de retry, segunda geracao, resumo por outra LLM ou troca automatica
+para Gemma. `provider.allow_fallbacks=true` permite somente providers elegiveis
+do mesmo modelo, sem fallback automatico entre modelos.
+Nenhum provider e fixado por nome. Endpoints incompativeis com preco zero ou
+`data_collection=deny` nao sao elegiveis; custo/privacidade nunca sao relaxados.
+Se Ling falhar, a mensagem local fixa de indisponibilidade e sintetizada
+uma vez, disponibilizada na AudioQueue e entregue antes de o consumidor encerrar
+a interacao `failed` e retornar a IDLE, sem nova chamada LLM.
 
-Reasoning: o Gemma configuravel recebe `enabled=false`; os tres modelos recebem
-`exclude=true`. Nao se impõe `effort=none` nas alternativas sem confirmacao de
-suporte. O parser usa somente `message.content` / `delta.content`, nunca campos
+Reasoning: Ling recebe somente `exclude=true`, sem `enabled=false` ou effort
+especifico de modelo. O override individual Gemma preserva `enabled=false`.
+Excluir reasoning da resposta nao garante desativar o pensamento interno nem
+libera seu orcamento de tokens; uma resposta final vazia segue o erro controlado
+existente. O parser usa somente `message.content` / `delta.content`, nunca campos
 `reasoning` ou `reasoning_details`. SpeechTextSanitizer permanece nos caminhos
 incremental e sincrono, sem resumir semanticamente a resposta.
 
-Referencias oficiais: [provider routing](https://openrouter.ai/docs/guides/routing/provider-selection),
+Diagnosticos HTTP (inclusive 429): registram status, `error.code` numerico ou
+categoria aprovada, e uma mensagem curta projetada em categorias fixas.
+Trechos livres da mensagem remota nunca sao ecoados. O escopo de rate limit so
+e indicado quando mencionado no erro; sem evidencia, aparece `unspecified`.
+Metadata passa por allowlists: `error_type`, `provider_code`, `provider_name` e
+`model`; campos desconhecidos, `raw`, headers e identificadores sao omitidos.
+O corpo de erro e lido ate 8193 bytes; acima do limite de 8192 bytes ou com JSON
+invalido, so o status e a indisponibilidade dos detalhes sao registrados.
+Chave, Authorization, prompt, contexto, audio e dados pessoais nao sao impressos
+por esses diagnosticos. `routed_model` vem da resposta/SSE, sem request extra,
+e e opcional; slugs conhecidos (tambem sem `:free`) sao registrados uma vez por
+stream, e valores desconhecidos sao substituidos por `[unrecognized]`.
+Um erro apos conteudo parcial nao reinicia o stream: preserva o aviso local de
+interrupcao e as sequencias de audio existentes.
+
+Referencias oficiais: [errors and debugging](https://openrouter.ai/docs/api_reference/errors-and-debugging),
+[provider routing](https://openrouter.ai/docs/guides/routing/provider-selection),
 [reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens) e
-[Inkling Small free](https://openrouter.ai/thinkingmachines/inkling-small:free).
+[Ling 3.1 Flash](https://openrouter.ai/inclusionai/ling-3.1-flash).
 
 Guardrail externo informado pelo usuario: `Koda - Free Models`, associado apenas
-a chave normal do Koda. Segunda barreira recomendada: Only Allow dos tres modelos
-acima, sem provider allowlist; Prompt Injection regex = Flag, User messages only;
+a chave normal do Koda. Segunda barreira recomendada: Only Allow dos dois modelos
+autorizados (Ling e Gemma), sem provider allowlist; Prompt Injection regex = Flag, User messages only;
 Sensitive Info com Email address, Phone number, Social Security number, Credit
 card number e API keys and secrets. O codigo nao cria/edita Guardrails, nao usa
 Management API/key e nao documenta segredos. Flag nao significa bloqueio automatico.

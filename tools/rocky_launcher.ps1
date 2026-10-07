@@ -34,7 +34,7 @@ if (-not $startApi) {
 }
 
 do {
-    $answer = Read-Host "Usar o modelo gratuito google/gemma-4-31b-it:free? [S/N]"
+    $answer = Read-Host "Usar Ling 3.1 Flash no Koda com preço máximo zero? [S/N]"
     switch ($answer.Trim().ToUpperInvariant()) {
         "S" { $useRockyModel = $true }
         "N" { $useRockyModel = $false }
@@ -47,7 +47,8 @@ if (-not $useRockyModel) {
     exit 0
 }
 
-$env:OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+# Sem override, o backend usa Ling; altera somente este processo.
+$env:OPENROUTER_MODEL = $null
 $secureApiKey = Read-Host "Cole sua chave OpenRouter" -AsSecureString
 $apiKeyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureApiKey)
 try {

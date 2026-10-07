@@ -2,7 +2,10 @@
 
 import json
 import os
+import socket
 import time
+from http.client import HTTPException
+from threading import Timer
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -14,15 +17,61 @@ from services.latency import mark_latency
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "google/gemma-4-31b-it:free"
-ALLOWED_FREE_MODELS = frozenset({
-    DEFAULT_MODEL,
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "thinkingmachines/inkling-small:free",
-})
+DEFAULT_MODEL = "inclusionai/ling-3.1-flash"
+GEMMA_MODEL = "google/gemma-4-31b-it:free"
+ALLOWED_FREE_MODELS = frozenset({DEFAULT_MODEL, GEMMA_MODEL})
 REQUEST_TIMEOUT_SECONDS = 20
+STREAM_DEADLINE_SECONDS = 120
 MAX_RESPONSE_TOKENS = 120
 RESPONSE_TEMPERATURE = 0.2
+MAX_ERROR_BODY_BYTES = 8192
+SAFE_ERROR_CODES = frozenset({
+    "rate_limit_exceeded", "rate_limited", "provider_overloaded", "provider_unavailable",
+    "context_length_exceeded", "max_tokens_exceeded", "token_limit_exceeded", "string_too_long",
+    "authentication", "permission_denied", "payment_required", "insufficient_quota",
+    "invalid_request", "invalid_prompt", "not_found", "precondition_failed",
+    "payload_too_large", "unprocessable", "content_policy_violation", "refusal",
+    "internal_server_error", "server_error", "provider_timeout",
+})
+SAFE_PROVIDER_NAMES = frozenset({
+    "Google", "Google AI Studio", "Google Vertex", "NVIDIA", "Chutes",
+    "DeepInfra", "Together", "Fireworks", "Novita", "SiliconFlow",
+})
+SAFE_ROUTED_MODELS = ALLOWED_FREE_MODELS | frozenset(
+    model.removesuffix(":free") for model in ALLOWED_FREE_MODELS
+)
+
+
+class _StreamDeadline:
+    """Limita tambem uma leitura SSE bloqueada recebendo bytes sem newline."""
+
+    def __init__(self, response: Any, expires_at: float) -> None:
+        self._response = response
+        self._expires_at = expires_at
+        self._timer = Timer(max(0, expires_at - time.monotonic()), self._abort)
+        self._timer.daemon = True
+
+    def __enter__(self) -> "_StreamDeadline":
+        self.check()
+        self._timer.start()
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self._timer.cancel()
+
+    def check(self) -> None:
+        if time.monotonic() >= self._expires_at:
+            raise LLMError("OpenRouter stream total deadline exceeded")
+
+    def _abort(self) -> None:
+        # HTTPResponse.close pode esperar pelo lock da leitura; shutdown a desbloqueia.
+        raw = getattr(getattr(self._response, "fp", None), "raw", None)
+        connection = getattr(raw, "_sock", None)
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
 class OpenRouterLLMClient:
@@ -40,12 +89,14 @@ class OpenRouterLLMClient:
             with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 response_body = response.read()
         except HTTPError as error:
-            print(f"[LLM] http_status={error.code}")
+            self._log_http_error(error)
             raise LLMError(f"OpenRouter HTTP {error.code}") from error
         except TimeoutError as error:
             raise LLMError("OpenRouter request timed out") from error
         except URLError as error:
             raise LLMError("OpenRouter connection failed") from error
+        except (OSError, HTTPException) as error:
+            raise LLMError("OpenRouter response interrupted") from error
 
         elapsed_ms = round((time.monotonic() - started_at) * 1000)
         result = self._parse_response(response_body)
@@ -62,6 +113,7 @@ class OpenRouterLLMClient:
         self._validate_free_configuration()
         request = self._build_request(message, context, stream=True)
         self._log_request(stream=True)
+        expires_at = time.monotonic() + STREAM_DEADLINE_SECONDS
         model_logged = False
 
         def log_model(model: str) -> None:
@@ -72,9 +124,10 @@ class OpenRouterLLMClient:
                 model_logged = True
 
         try:
-            with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response, _StreamDeadline(response, expires_at) as deadline:
                 completed = False
                 for raw_line in response:
+                    deadline.check()
                     line = raw_line.decode("utf-8").strip()
                     if not line or line.startswith(":") or not line.startswith("data:"):
                         continue
@@ -85,16 +138,20 @@ class OpenRouterLLMClient:
                         break
 
                     yield from self._parse_stream_event(data, log_model)
+                    deadline.check()
 
+                deadline.check()
                 if not completed:
                     raise LLMError("OpenRouter stream ended before completion")
         except HTTPError as error:
-            print(f"[LLM] http_status={error.code}")
+            self._log_http_error(error)
             raise LLMError(f"OpenRouter HTTP {error.code}") from error
         except TimeoutError as error:
             raise LLMError("OpenRouter request timed out") from error
         except URLError as error:
             raise LLMError("OpenRouter connection failed") from error
+        except (OSError, HTTPException) as error:
+            raise LLMError("OpenRouter response interrupted") from error
 
     def _validate_free_configuration(self) -> None:
         if not self._api_key:
@@ -135,9 +192,9 @@ class OpenRouterLLMClient:
         )
 
     def _reasoning_preferences(self) -> dict[str, Any]:
-        # Gemma permite desligar thinking; alternativas nao recebem effort nao confirmado.
+        # Ling usa apenas exclude; a preferencia anterior do override Gemma permanece.
         preferences: dict[str, Any] = {"exclude": True}
-        if self._model == DEFAULT_MODEL:
+        if self._model == GEMMA_MODEL:
             preferences["enabled"] = False
         return preferences
 
@@ -161,6 +218,9 @@ class OpenRouterLLMClient:
     def _parse_response(response_body: bytes) -> LLMResult:
         try:
             payload: dict[str, Any] = json.loads(response_body)
+            if isinstance(payload, dict) and "error" in payload:
+                OpenRouterLLMClient._log_error_details(payload)
+                raise LLMError("OpenRouter returned an error response")
             choices = payload["choices"]
             content = choices[0]["message"]["content"]
         except (IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
@@ -180,6 +240,7 @@ class OpenRouterLLMClient:
             raise LLMError("OpenRouter returned an invalid stream event") from error
 
         if "error" in payload:
+            OpenRouterLLMClient._log_error_details(payload)
             raise LLMError("OpenRouter returned a stream error")
 
         model = payload.get("model")
@@ -200,5 +261,76 @@ class OpenRouterLLMClient:
 
     @staticmethod
     def _log_routed_model(model: str) -> None:
-        preview = "".join(character for character in model[:160] if character.isprintable())
-        print(f"[LLM] routed_model={preview}")
+        # O campo remoto tambem pode conter texto arbitrario; nao ecoar valores desconhecidos.
+        print(f"[LLM] routed_model={model if model in SAFE_ROUTED_MODELS else '[unrecognized]'}")
+
+    @classmethod
+    def _log_http_error(cls, error: HTTPError) -> None:
+        print(f"[LLM] http_status={error.code}")
+        try:
+            with error:
+                body = error.read(MAX_ERROR_BODY_BYTES + 1)
+            if len(body) > MAX_ERROR_BODY_BYTES:
+                print("[LLM] error_body=too_large; details omitted")
+                return
+            cls._log_error_details(json.loads(body))
+        except (OSError, HTTPException, ValueError, TypeError, RecursionError):
+            print("[LLM] error_body=unavailable_or_invalid; details omitted")
+
+    @classmethod
+    def _log_error_details(cls, payload: Any) -> None:
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if not isinstance(error, dict):
+            return
+        code = cls._safe_error_code(error.get("code"))
+        if code is not None:
+            print(f"[LLM] error_code={code}")
+        message = error.get("message")
+        if isinstance(message, str) and message:
+            print(f"[LLM] error_message={json.dumps(cls._safe_error_message(message))}")
+        metadata = error.get("metadata")
+        if isinstance(metadata, dict):
+            cls._log_safe_metadata(metadata)
+
+    @staticmethod
+    def _safe_error_code(value: Any) -> str | int | None:
+        if type(value) is int and 100 <= value <= 599:
+            return value
+        if isinstance(value, str) and value in SAFE_ERROR_CODES:
+            return value
+        return None
+
+    @staticmethod
+    def _safe_error_message(message: str) -> str:
+        # Projecao fechada: nunca imprimir trechos livres, mesmo truncados, do corpo remoto.
+        normalized = message[:MAX_ERROR_BODY_BYTES].lower()
+        if "rate limit" in normalized or "rate_limit" in normalized or "rate-limit" in normalized:
+            scope = next((name for name in ("account", "model", "provider", "upstream")
+                          if name in normalized), "unspecified")
+            return f"Rate limit reported; scope={scope}."
+        categories = (
+            (("overloaded", "capacity"), "Capacity limit reported."),
+            (("data policy", "data collection", "privacy"), "Provider privacy policy incompatibility reported."),
+            (("no endpoints", "unavailable"), "No eligible endpoint or service unavailable reported."),
+            (("quota", "credits", "payment"), "Quota or credit limit reported."),
+            (("guardrail", "policy violation"), "Policy restriction reported."),
+            (("authentication", "unauthorized", "api key"), "Authentication failure reported."),
+            (("context length", "token limit"), "Token or context limit reported."),
+        )
+        for patterns, safe_message in categories:
+            if any(pattern in normalized for pattern in patterns):
+                return safe_message
+        return "Unrecognized error message; details omitted."
+
+    @classmethod
+    def _log_safe_metadata(cls, metadata: dict[str, Any]) -> None:
+        for field in ("error_type", "provider_code"):
+            value = cls._safe_error_code(metadata.get(field))
+            if value is not None:
+                print(f"[LLM] metadata.{field}={value}")
+        provider = metadata.get("provider_name")
+        if isinstance(provider, str) and provider in SAFE_PROVIDER_NAMES:
+            print(f"[LLM] metadata.provider_name={provider}")
+        model = metadata.get("model")
+        if isinstance(model, str) and model in SAFE_ROUTED_MODELS:
+            print(f"[LLM] metadata.model={model}")

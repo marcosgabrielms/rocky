@@ -1,6 +1,7 @@
-fastapi
-uvicorn[standard]
-python-multipart
-faster-whisper
-tzdata
-piper-tts
+-c requirements-lock.txt
+fastapi==0.141.1
+uvicorn[standard]==0.52.3
+python-multipart==0.0.32
+faster-whisper==1.2.1
+tzdata==2026.3
+piper-tts==1.7.0

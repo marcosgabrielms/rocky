@@ -3,7 +3,6 @@
 import audioop
 import os
 import struct
-import winsound
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +87,7 @@ class LocalResponseSpeaker:
                 report_pcm_metrics(analyze_pcm_wav(self._output_path))
 
                 if self._enable_local_playback:
+                    import winsound
                     winsound.PlaySound(str(self._output_path), winsound.SND_FILENAME)
         except Exception as error:
             print(f"[TTS] error={error}")
@@ -100,7 +100,7 @@ class LocalResponseSpeaker:
 
 
 def get_local_playback_enabled() -> bool:
-    value = os.getenv("ROCKY_LOCAL_TTS_PLAYBACK", "1").strip().casefold()
+    value = os.getenv("ROCKY_LOCAL_TTS_PLAYBACK", "1" if os.name == "nt" else "0").strip().casefold()
     return value not in {"0", "false", "no", "off"}
 
 

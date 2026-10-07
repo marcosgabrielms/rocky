@@ -9,6 +9,8 @@ from collections.abc import Callable
 
 from services.tts.realtime import RealtimeAudioSegment
 
+INTERACTION_MAXIMUM_AGE_SECONDS = 300
+
 
 class AudioItemStatus(StrEnum):
     READY = "ready"
@@ -66,6 +68,7 @@ class RealtimeAudioQueue:
         self._interactions: dict[int, _Interaction] = {}
 
     def create_interaction(self) -> int:
+        self.cleanup_expired(INTERACTION_MAXIMUM_AGE_SECONDS)
         with self._lock:
             interaction_id = self._next_interaction_id
             self._next_interaction_id += 1
@@ -143,6 +146,11 @@ class RealtimeAudioQueue:
     def mark_production_failed(self, interaction_id: int) -> None:
         self._mark_production(interaction_id, AudioProductionStatus.FAILED)
 
+    def finish_if_active(self, interaction_id: int, *, failed: bool) -> None:
+        """Finaliza uma vez, sem ressuscitar cancelamentos ou interacoes removidas."""
+        status = AudioProductionStatus.FAILED if failed else AudioProductionStatus.COMPLETED
+        self._mark_production(interaction_id, status, tolerate_terminal=True)
+
     def cancel(self, interaction_id: int) -> None:
         with self._lock:
             interaction = self._get_interaction(interaction_id)
@@ -193,16 +201,14 @@ class RealtimeAudioQueue:
         return True
 
     def cleanup_expired(self, maximum_age_seconds: float) -> tuple[int, ...]:
-        """Descarta interações terminais antigas, inclusive WAVs ainda pendentes."""
+        """Descarta interacoes sem progresso, inclusive produtores orfaos e WAVs pendentes."""
         now = self._clock()
         removed_ids: list[int] = []
         with self._lock:
             for interaction_id, interaction in tuple(self._interactions.items()):
-                if (
-                    interaction.production_status is AudioProductionStatus.ACTIVE
-                    or now - interaction.updated_at < maximum_age_seconds
-                ):
+                if now - interaction.updated_at < maximum_age_seconds:
                     continue
+                interaction.production_status = AudioProductionStatus.CANCELLED
                 for sequence, item in tuple(interaction.items.items()):
                     if item.status is AudioItemStatus.READY:
                         interaction.items[sequence] = replace(item, status=AudioItemStatus.CANCELLED)
@@ -213,8 +219,14 @@ class RealtimeAudioQueue:
             print(f"[RTQ] cleanup_expired interaction={interaction_id}")
         return tuple(removed_ids)
 
-    def _mark_production(self, interaction_id: int, status: AudioProductionStatus) -> None:
+    def _mark_production(
+        self, interaction_id: int, status: AudioProductionStatus, *, tolerate_terminal: bool = False
+    ) -> None:
         with self._lock:
+            if tolerate_terminal:
+                interaction = self._interactions.get(interaction_id)
+                if interaction is None or interaction.production_status is not AudioProductionStatus.ACTIVE:
+                    return
             interaction = self._get_active_interaction(interaction_id)
             interaction.production_status = status
             interaction.updated_at = self._clock()

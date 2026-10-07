@@ -3,7 +3,10 @@
 from dataclasses import dataclass
 
 from services.audio_queue import RealtimeAudioQueue
-from services.conversation import ConversationManager, InteractionDecision, StreamedConversationResponse
+from services.conversation import (
+    ConversationManager, InteractionDecision, StreamedConversationResponse,
+    LLM_UNAVAILABLE_MESSAGE, LLM_INTERRUPTED_MESSAGE,
+)
 from services.tts.realtime import RealtimeAudioSegment, RealtimeTTS, RealtimeTTSSession
 from services.latency import latency_metric, mark_latency
 from services.tts.speech_text import SpeechTextSanitizer, log_speech_text
@@ -37,7 +40,12 @@ class RealtimeAudioService:
         return self._audio_queue
 
     def create_interaction(self) -> int:
-        return self._audio_queue.create_interaction()
+        interaction_id = self._audio_queue.create_interaction()
+        try:
+            self._realtime_tts.cleanup_orphaned_audio(self._audio_queue.ready_audio_paths())
+        except Exception as error:
+            print(f"[RT] cleanup_error type={type(error).__name__}")
+        return interaction_id
 
     def build_stream_audio_response(
         self, text: str, device_id: str, interaction_id: int | None = None
@@ -51,6 +59,7 @@ class RealtimeAudioService:
         session: RealtimeTTSSession | None = None
         segments: list[RealtimeAudioSegment] = []
         tts_failed = False
+        production_failed = True
         sanitizer = SpeechTextSanitizer()
 
         def synthesize_sentence(sentence: str, sequence: int, ready_ms: int) -> None:
@@ -65,14 +74,13 @@ class RealtimeAudioService:
                 return
 
             print(f"[RT] sentence_ready seq={sequence} ms={ready_ms}")
-            if session is None:
-                if interaction_id is None:
-                    interaction_id = self._audio_queue.create_interaction()
-                session = self._realtime_tts.begin_interaction(
-                    interaction_id,
-                    self._audio_queue.ready_audio_paths(),
-                )
             try:
+                if interaction_id is None:
+                    interaction_id = self.create_interaction()
+                if session is None:
+                    session = self._realtime_tts.begin_interaction(
+                        interaction_id, self._audio_queue.ready_audio_paths(),
+                    )
                 audio_sequence = len(segments)
                 segment = session.synthesize(spoken_text, audio_sequence)
                 self._audio_queue.enqueue(interaction_id, segment)
@@ -83,17 +91,28 @@ class RealtimeAudioService:
                 segments.append(segment)
             except Exception as error:
                 tts_failed = True
-                print(f"[RT] tts_error seq={sequence} error={error}")
+                print(f"[RT] tts_error seq={sequence} type={type(error).__name__}")
 
-        conversation = self._conversation_manager.build_stream_response_from_decision(
-            decision,
-            on_sentence=synthesize_sentence,
-        )
-        if interaction_id is not None:
-            if tts_failed or conversation.stream_failed:
-                self._audio_queue.mark_production_failed(interaction_id)
-            else:
-                self._audio_queue.mark_production_done(interaction_id)
+        try:
+            try:
+                conversation = self._conversation_manager.build_stream_response_from_decision(
+                    decision, on_sentence=synthesize_sentence,
+                )
+            except Exception as error:
+                print(f"[RT] producer_error type={type(error).__name__}")
+                message = LLM_INTERRUPTED_MESSAGE if segments else LLM_UNAVAILABLE_MESSAGE
+                conversation = StreamedConversationResponse(
+                    response={"text": message, "interaction_state": "idle", "actions": []},
+                    sentences=(), stream_failed=True,
+                )
+            if conversation.stream_failed:
+                message = LLM_INTERRUPTED_MESSAGE if segments else LLM_UNAVAILABLE_MESSAGE
+                synthesize_sentence(message, len(segments), 0)
+            production_failed = tts_failed or conversation.stream_failed
+        finally:
+            # BaseException continua propagando, mas nao deixa uma fila ACTIVE.
+            if interaction_id is not None:
+                self._audio_queue.finish_if_active(interaction_id, failed=production_failed)
         return StreamedAudioResponse(
             conversation=conversation,
             audio_segments=tuple(segments),

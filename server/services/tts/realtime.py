@@ -11,6 +11,8 @@ from services.tts.base import TTSClient
 from services.tts.response_speaker import SUPPORTED_SAMPLE_RATE, resample_wav
 from services.latency import latency_metric, mark_latency
 
+ORPHAN_AUDIO_MAXIMUM_AGE_SECONDS = 300
+
 
 @dataclass(frozen=True)
 class RealtimeAudioSegment:
@@ -57,17 +59,26 @@ class RealtimeTTS:
         interaction_id: int | None = None,
         protected_audio_paths: Collection[Path] = (),
     ) -> RealtimeTTSSession:
-        """Remove somente artefatos realtime anteriores antes de uma nova interação."""
+        """Abre a sessao sem apagar arquivos de outro produtor ainda em andamento."""
         with self._lock:
             self._output_directory.mkdir(parents=True, exist_ok=True)
-            protected_paths = {path.resolve() for path in protected_audio_paths}
-            for audio_path in self._output_directory.glob(f"{self._FILENAME_PREFIX}*.wav"):
-                if audio_path.resolve() not in protected_paths:
-                    audio_path.unlink()
             if interaction_id is None:
                 interaction_id = self._next_interaction_id
             self._next_interaction_id = max(self._next_interaction_id, interaction_id + 1)
+        self.cleanup_orphaned_audio(protected_audio_paths)
         return RealtimeTTSSession(self, interaction_id)
+
+    def cleanup_orphaned_audio(self, protected_audio_paths: Collection[Path] = ()) -> None:
+        """Remove WAVs antigos sem fila, preservando arquivos recentes e paths externos."""
+        protected = {path.resolve() for path in protected_audio_paths}
+        now = time.time()  # mtime de arquivos usa epoch, nao o relogio monotonic da fila.
+        with self._lock:
+            for path in self._output_directory.glob(f"{self._FILENAME_PREFIX}*.wav"):
+                resolved = path.resolve()
+                if resolved.parent != self._output_directory.resolve() or resolved in protected:
+                    continue
+                if now - path.stat().st_mtime >= ORPHAN_AUDIO_MAXIMUM_AGE_SECONDS:
+                    path.unlink()
 
     def _synthesize(self, interaction_id: int, text: str, sequence: int) -> RealtimeAudioSegment:
         if not text.strip():
@@ -79,11 +90,16 @@ class RealtimeTTS:
         if sequence == 0:
             mark_latency("tts_start")
         with self._lock:
-            self._tts_client.synthesize_to_wav(text, output_path)
-            resample_wav(output_path, SUPPORTED_SAMPLE_RATE)
+            try:
+                self._tts_client.synthesize_to_wav(text, output_path)
+                resample_wav(output_path, SUPPORTED_SAMPLE_RATE)
+                segment = self._read_segment(output_path, text, sequence)
+            except Exception:
+                if output_path.resolve().parent == self._output_directory.resolve():
+                    output_path.unlink(missing_ok=True)
+                raise
 
         elapsed_ms = round((time.monotonic() - started_at) * 1000)
-        segment = self._read_segment(output_path, text, sequence)
         if sequence == 0:
             mark_latency("tts_ready")
             latency_metric("tts_first_sentence_ms", "tts_start", "tts_ready")

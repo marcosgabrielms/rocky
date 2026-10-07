@@ -7,8 +7,9 @@ class SentenceBuffer:
     """Mantém somente o texto ainda não terminado por pontuação final."""
 
     _SENTENCE_ENDINGS = frozenset(".!?")
+    _ABBREVIATIONS = frozenset({"sr", "sra", "dr", "dra"})
     _PROTECTED_TEXT = re.compile(
-        r"(```|~~~).*?(?:\1|$)|!?\[[^\]]*\]\([^)]*(?:\)|$)|(?:https?://|www\.)\S+",
+        r"(```|~~~).*?(?:\1|$)|<think\b[^>]*>.*?(?:</think\s*>|$)|!?\[[^\]]*\]\([^)]*(?:\)|$)|(?:https?://|www\.)\S+",
         re.DOTALL | re.IGNORECASE,
     )
 
@@ -30,6 +31,8 @@ class SentenceBuffer:
                 continue
             if any(start <= index < end for start, end in protected_spans):
                 continue
+            if character == "." and self._is_nonterminal_period(index):
+                continue
 
             sentence = self._normalize(self._pending[start : index + 1])
             if sentence:
@@ -44,6 +47,14 @@ class SentenceBuffer:
         residual = self._normalize(self._pending)
         self._pending = ""
         return residual
+
+    def _is_nonterminal_period(self, index: int) -> bool:
+        if index > 0 and self._pending[index - 1].isdigit():
+            # Um ponto numerico no fim do chunk exige um caractere de lookahead.
+            if index + 1 == len(self._pending) or self._pending[index + 1].isdigit():
+                return True
+        word = re.search(r"([A-Za-z]+)$", self._pending[:index])
+        return word is not None and word.group(1).casefold() in self._ABBREVIATIONS
 
     def _protected_spans(self) -> tuple[tuple[int, int], ...]:
         spans = []

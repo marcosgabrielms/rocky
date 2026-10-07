@@ -37,14 +37,15 @@ REALTIME_LONG_POLL_INTERVAL_MS = 50
 app = FastAPI()
 llm_client = OpenRouterLLMClient()
 conversation_manager = ConversationManager(0, llm_client)
+tts_client = PiperTTS(TTS_MODEL_PATH)
 response_speaker = LocalResponseSpeaker(
-    PiperTTS(TTS_MODEL_PATH),
+    tts_client,
     TTS_OUTPUT_PATH,
     enable_local_playback=get_local_playback_enabled(),
 )
 realtime_audio_service = RealtimeAudioService(
     conversation_manager,
-    RealtimeTTS(PiperTTS(TTS_MODEL_PATH), REALTIME_TTS_DIRECTORY),
+    RealtimeTTS(tts_client, REALTIME_TTS_DIRECTORY),
 )
 
 
@@ -125,10 +126,23 @@ async def _transcribe_realtime(
     report_latency("interaction_id", interaction_id)
 
     def produce() -> None:
-        realtime_audio_service.build_stream_audio_response_from_decision(decision, interaction_id)
+        try:
+            realtime_audio_service.build_stream_audio_response_from_decision(decision, interaction_id)
+        except Exception as error:
+            print(f"[RTD] producer_error type={type(error).__name__}")
+        finally:
+            realtime_audio_service.audio_queue.finish_if_active(interaction_id, failed=True)
 
     request_context = copy_context()
-    Thread(target=lambda: request_context.run(produce), name=f"rocky-realtime-{interaction_id}", daemon=True).start()
+    thread_started = False
+    try:
+        Thread(target=lambda: request_context.run(produce), name=f"rocky-realtime-{interaction_id}", daemon=True).start()
+        thread_started = True
+    except Exception as error:
+        print(f"[RTD] thread_start_error type={type(error).__name__}")
+    finally:
+        if not thread_started:
+            realtime_audio_service.audio_queue.finish_if_active(interaction_id, failed=True)
     return {
         "realtime": True,
         "interaction_id": interaction_id,

@@ -10,11 +10,13 @@ MAX_LOG_CHARACTERS = 240
 
 class SpeechTextSanitizer:
     def sanitize(self, text: str) -> str:
+        text = re.sub(r"<think\b[^>]*>.*?(?:</think\s*>|$)", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"</?think\b[^>]*>", "", text, flags=re.IGNORECASE)
         text = re.sub(r"(```|~~~).*?(?:\1|$)", "", text, flags=re.DOTALL)
         text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
         text = re.sub(r"(?:https?://|www\.)\S+", "", text, flags=re.IGNORECASE)
         text = re.sub(r"(?m)^\s*[-*_]{3,}\s*$", "", text)
-        text = re.sub(r"(?m)^[ \t]*(?:#{1,6}\s*|[-+*•]\s+|\d+[.)](?:\s+|$)|>\s+)", "", text)
+        text = re.sub(r"(?m)^[ \t]*(?:#{1,6}\s*|[-+*•]\s+|\d+[.)][ \t]+(?=\S)|>\s+)", "", text)
         text = text.replace("*", "").replace("`", "").replace("__", "")
         text = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", text)
         text = re.sub(

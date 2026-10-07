@@ -65,6 +65,12 @@ void appendMultipartField(String& prefix, const char* name, const String& value)
 }
 } // namespace
 
+uint32_t SttClient::RealtimeDeadline::remainingMs() const
+{
+    const uint32_t elapsedMs = millis() - startedAt;
+    return elapsedMs < REALTIME_TOTAL_DEADLINE_MS ? REALTIME_TOTAL_DEADLINE_MS - elapsedMs : 0;
+}
+
 bool SttClient::checkHealth()
 {
     WiFiClient client;
@@ -207,7 +213,7 @@ bool SttClient::playAudioPath(Speaker& speaker, const String& path, const Playba
 
 bool SttClient::playWavResponse(Speaker& speaker, WiFiClient& client, size_t wavSize,
                               const PlaybackCallbacks& callbacks, const uint32_t* sequence,
-                              const uint32_t* previousPlaybackEnd) const
+                              const uint32_t* previousPlaybackEnd, const RealtimeDeadline* deadline) const
 {
     uint8_t* const wavData = static_cast<uint8_t*>(heap_caps_malloc(wavSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (wavData == nullptr)
@@ -219,13 +225,30 @@ bool SttClient::playWavResponse(Speaker& speaker, WiFiClient& client, size_t wav
     size_t receivedBytes = 0;
     uint32_t downloadChunks = 0;
     uint32_t shortReads = 0;
+    uint32_t lastReceivedAt = millis();
     while (receivedBytes < wavSize)
     {
-        const size_t requestedBytes = min(RESPONSE_AUDIO_BLOCK_BYTES, wavSize - receivedBytes);
-        const size_t chunkBytes = client.readBytes(reinterpret_cast<char*>(wavData + receivedBytes), requestedBytes);
-        if (chunkBytes == 0)
+        if (deadline != nullptr && (deadline->remainingMs() == 0 || millis() - lastReceivedAt >= HTTP_TIMEOUT_MS))
             break;
+        const size_t requestedBytes = min(RESPONSE_AUDIO_BLOCK_BYTES, wavSize - receivedBytes);
+        if (deadline != nullptr && !client.available())
+        {
+            if (!client.connected())
+                break;
+            if (callbacks.onProgress != nullptr)
+                callbacks.onProgress();
+            yield();
+            continue;
+        }
+        // readBytes renova o timeout por bloco; realtime usa leituras disponiveis limitadas.
+        const int readResult = deadline == nullptr
+            ? static_cast<int>(client.readBytes(reinterpret_cast<char*>(wavData + receivedBytes), requestedBytes))
+            : client.read(wavData + receivedBytes, min(requestedBytes, static_cast<size_t>(client.available())));
+        if (readResult <= 0)
+            break;
+        const size_t chunkBytes = static_cast<size_t>(readResult);
 
+        lastReceivedAt = millis();
         if (chunkBytes < requestedBytes)
             ++shortReads;
         ++downloadChunks;
@@ -233,7 +256,7 @@ bool SttClient::playWavResponse(Speaker& speaker, WiFiClient& client, size_t wav
         if (callbacks.onProgress != nullptr)
             callbacks.onProgress();
     }
-    if (receivedBytes != wavSize)
+    if (receivedBytes != wavSize || (deadline != nullptr && deadline->remainingMs() == 0))
     {
         heap_caps_free(wavData);
         Serial.println("[AUDIO] download failed");
@@ -281,6 +304,12 @@ bool SttClient::playWavResponse(Speaker& speaker, WiFiClient& client, size_t wav
     uint32_t writeFailures = 0;
     while (playedBytes < wavInfo.pcmByteCount)
     {
+        if (deadline != nullptr && deadline->remainingMs() == 0)
+        {
+            speaker.stop();
+            heap_caps_free(wavData);
+            return false;
+        }
         const size_t chunkBytes = min(RESPONSE_AUDIO_BLOCK_BYTES, wavInfo.pcmByteCount - playedBytes);
         const int16_t* const samples = reinterpret_cast<const int16_t*>(wavInfo.pcmData + playedBytes);
         if (!speaker.playMonoPcm(samples, chunkBytes / sizeof(int16_t)))
@@ -315,16 +344,31 @@ bool SttClient::playWavResponse(Speaker& speaker, WiFiClient& client, size_t wav
 bool SttClient::playRealtimeInteraction(Speaker& speaker, uint32_t interactionId,
                                        const PlaybackCallbacks& callbacks)
 {
+    const RealtimeDeadline deadline;
+    const bool result = pollRealtimeInteraction(speaker, interactionId, callbacks, deadline);
+    if (deadline.remainingMs() == 0)
+    {
+        Serial.println("[RT] total deadline exceeded");
+        return false;
+    }
+    return result;
+}
+
+bool SttClient::pollRealtimeInteraction(Speaker& speaker, uint32_t interactionId,
+                                       const PlaybackCallbacks& callbacks, const RealtimeDeadline& deadline)
+{
     uint32_t expectedSequence = 0;
     uint32_t playbackEndedAt = 0;
     bool hasPreviousPlayback = false;
     while (true)
     {
+        if (deadline.remainingMs() == 0)
+            return false;
         WiFiClient client;
-        client.setTimeout(HTTP_TIMEOUT_MS);
+        client.setTimeout(min(HTTP_TIMEOUT_MS, deadline.remainingMs()));
         const String path = String("/realtime/audio/") + interactionId + "/next?timeout_ms=1000";
         Serial.printf("[RT] waiting_audio seq=%lu\n", static_cast<unsigned long>(expectedSequence));
-        if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) ||
+        if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT, min(HTTP_TIMEOUT_MS, deadline.remainingMs())) ||
             client.printf("GET %s HTTP/1.1\r\nHost: %s:%u\r\nConnection: close\r\n\r\n",
                           path.c_str(), STT_SERVER_HOST, STT_SERVER_PORT) <= 0)
         {
@@ -333,7 +377,12 @@ bool SttClient::playRealtimeInteraction(Speaker& speaker, uint32_t interactionId
             return false;
         }
         HttpResponseHeaders headers;
-        const int statusCode = readResponseHeaders(client, headers, callbacks.onProgress);
+        const int statusCode = readResponseHeaders(client, headers, callbacks.onProgress, &deadline);
+        if (deadline.remainingMs() == 0)
+        {
+            client.stop();
+            return false;
+        }
         if (statusCode == 200 && headers.isWavResponse)
         {
             if (!headers.hasInteractionId)
@@ -376,7 +425,7 @@ bool SttClient::playRealtimeInteraction(Speaker& speaker, uint32_t interactionId
                           static_cast<unsigned long>(headers.sequence));
             const bool playbackSucceeded = playWavResponse(
                 speaker, client, headers.contentLength, callbacks, &expectedSequence,
-                hasPreviousPlayback ? &playbackEndedAt : nullptr);
+                hasPreviousPlayback ? &playbackEndedAt : nullptr, &deadline);
             client.stop();
             if (!playbackSucceeded)
             {
@@ -386,7 +435,7 @@ bool SttClient::playRealtimeInteraction(Speaker& speaker, uint32_t interactionId
             playbackEndedAt = millis();
             hasPreviousPlayback = true;
             Serial.printf("[RT] playback_end seq=%lu\n", static_cast<unsigned long>(expectedSequence));
-            if (!acknowledgeRealtimeSegment(interactionId, expectedSequence))
+            if (!acknowledgeRealtimeSegment(interactionId, expectedSequence, deadline))
             {
                 Serial.println("[RT] ack_failed");
                 return false;
@@ -395,8 +444,10 @@ bool SttClient::playRealtimeInteraction(Speaker& speaker, uint32_t interactionId
             ++expectedSequence;
             continue;
         }
-        const String body = readResponseBody(client, callbacks.onProgress);
+        const String body = readResponseBody(client, callbacks.onProgress, &deadline);
         client.stop();
+        if (deadline.remainingMs() == 0)
+            return false;
         String status;
         extractJsonString(body, "status", status);
         if (status == "pending")
@@ -411,15 +462,18 @@ bool SttClient::playRealtimeInteraction(Speaker& speaker, uint32_t interactionId
     }
 }
 
-bool SttClient::acknowledgeRealtimeSegment(uint32_t interactionId, uint32_t sequence) const
+bool SttClient::acknowledgeRealtimeSegment(uint32_t interactionId, uint32_t sequence,
+                                          const RealtimeDeadline& deadline) const
 {
+    if (deadline.remainingMs() == 0)
+        return false;
     WiFiClient client;
-    client.setTimeout(HTTP_TIMEOUT_MS);
+    client.setTimeout(min(HTTP_TIMEOUT_MS, deadline.remainingMs()));
     const String path = String("/realtime/audio/") + interactionId + "/" + sequence + "/consumed";
-    const bool sent = client.connect(STT_SERVER_HOST, STT_SERVER_PORT) &&
+    const bool sent = client.connect(STT_SERVER_HOST, STT_SERVER_PORT, min(HTTP_TIMEOUT_MS, deadline.remainingMs())) &&
                       client.printf("POST %s HTTP/1.1\r\nHost: %s:%u\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                                     path.c_str(), STT_SERVER_HOST, STT_SERVER_PORT) > 0;
-    const bool acknowledged = sent && readStatusCode(client) == 200;
+    const bool acknowledged = sent && readStatusCode(client, &deadline) == 200;
     client.stop();
     return acknowledged;
 }
@@ -642,22 +696,47 @@ bool SttClient::writeAll(WiFiClient& client, const uint8_t* data, size_t dataSiz
     return true;
 }
 
-int SttClient::readStatusCode(WiFiClient& client)
+String SttClient::readHeaderLine(WiFiClient& client, const RealtimeDeadline* deadline)
+{
+    if (deadline == nullptr)
+        return client.readStringUntil('\n');
+
+    String line;
+    const uint32_t startedAt = millis();
+    while (deadline->remainingMs() > 0 && millis() - startedAt < HTTP_TIMEOUT_MS)
+    {
+        if (client.available())
+        {
+            const char character = static_cast<char>(client.read());
+            if (character == '\n')
+                return line;
+            if (line.length() >= MAX_RESPONSE_BYTES)
+                break;
+            line += character;
+        }
+        else if (!client.connected())
+            break;
+        yield();
+    }
+    return String();
+}
+
+int SttClient::readStatusCode(WiFiClient& client, const RealtimeDeadline* deadline)
 {
     const uint32_t startedAt = millis();
     while (!client.available())
     {
-        if (millis() - startedAt >= HTTP_TIMEOUT_MS)
+        if (millis() - startedAt >= HTTP_TIMEOUT_MS || (deadline != nullptr && deadline->remainingMs() == 0))
             return 0;
 
         yield();
     }
 
-    const String statusLine = client.readStringUntil('\n');
+    const String statusLine = readHeaderLine(client, deadline);
     if (!statusLine.startsWith("HTTP/"))
         return 0;
 
-    while (millis() - startedAt < HTTP_TIMEOUT_MS)
+    while (millis() - startedAt < HTTP_TIMEOUT_MS && (deadline == nullptr || deadline->remainingMs() > 0))
     {
         if (!client.available())
         {
@@ -665,7 +744,7 @@ int SttClient::readStatusCode(WiFiClient& client)
             continue;
         }
 
-        const String header = client.readStringUntil('\n');
+        const String header = readHeaderLine(client, deadline);
         if (header == "\r" || header.isEmpty())
             return statusLine.substring(9, 12).toInt();
     }
@@ -674,13 +753,13 @@ int SttClient::readStatusCode(WiFiClient& client)
 }
 
 int SttClient::readResponseHeaders(WiFiClient& client, HttpResponseHeaders& headers,
-                                  void (*onProgress)())
+                                  void (*onProgress)(), const RealtimeDeadline* deadline)
 {
     headers = {};
     const uint32_t startedAt = millis();
     while (!client.available())
     {
-        if (millis() - startedAt >= HTTP_TIMEOUT_MS)
+        if (millis() - startedAt >= HTTP_TIMEOUT_MS || (deadline != nullptr && deadline->remainingMs() == 0))
             return 0;
 
         if (onProgress != nullptr)
@@ -688,11 +767,11 @@ int SttClient::readResponseHeaders(WiFiClient& client, HttpResponseHeaders& head
         yield();
     }
 
-    const String statusLine = client.readStringUntil('\n');
+    const String statusLine = readHeaderLine(client, deadline);
     if (!statusLine.startsWith("HTTP/"))
         return 0;
 
-    while (millis() - startedAt < HTTP_TIMEOUT_MS)
+    while (millis() - startedAt < HTTP_TIMEOUT_MS && (deadline == nullptr || deadline->remainingMs() > 0))
     {
         if (!client.available())
         {
@@ -702,7 +781,7 @@ int SttClient::readResponseHeaders(WiFiClient& client, HttpResponseHeaders& head
             continue;
         }
 
-        const String header = client.readStringUntil('\n');
+        const String header = readHeaderLine(client, deadline);
         if (header == "\r" || header.isEmpty())
             return statusLine.substring(9, 12).toInt();
 
@@ -731,7 +810,7 @@ int SttClient::readResponseHeaders(WiFiClient& client, HttpResponseHeaders& head
     return 0;
 }
 
-String SttClient::readResponseBody(WiFiClient& client, void (*onProgress)())
+String SttClient::readResponseBody(WiFiClient& client, void (*onProgress)(), const RealtimeDeadline* deadline)
 {
     String body;
     body.reserve(MAX_RESPONSE_BYTES);
@@ -741,13 +820,15 @@ String SttClient::readResponseBody(WiFiClient& client, void (*onProgress)())
     {
         while (client.available())
         {
+            if (deadline != nullptr && deadline->remainingMs() == 0)
+                return String();
             if (body.length() >= MAX_RESPONSE_BYTES)
                 return body;
 
             body += static_cast<char>(client.read());
         }
 
-        if (millis() - startedAt >= HTTP_TIMEOUT_MS)
+        if (millis() - startedAt >= HTTP_TIMEOUT_MS || (deadline != nullptr && deadline->remainingMs() == 0))
             break;
 
         if (onProgress != nullptr)

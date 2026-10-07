@@ -94,6 +94,13 @@ private:
     };
 
     static constexpr uint32_t HTTP_TIMEOUT_MS = 60000;
+    static constexpr uint32_t REALTIME_TOTAL_DEADLINE_MS = 180000;
+
+    struct RealtimeDeadline
+    {
+        const uint32_t startedAt = millis();
+        uint32_t remainingMs() const;
+    };
 
     bool sendGetRequest(WiFiClient& client) const;
     bool sendMultipartRequest(WiFiClient& client,
@@ -105,8 +112,12 @@ private:
     bool playAudioPath(Speaker& speaker, const String& path, const PlaybackCallbacks& callbacks);
     bool playWavResponse(Speaker& speaker, WiFiClient& client, size_t wavSize,
                          const PlaybackCallbacks& callbacks, const uint32_t* sequence = nullptr,
-                         const uint32_t* previousPlaybackEnd = nullptr) const;
-    bool acknowledgeRealtimeSegment(uint32_t interactionId, uint32_t sequence) const;
+                         const uint32_t* previousPlaybackEnd = nullptr,
+                         const RealtimeDeadline* deadline = nullptr) const;
+    bool pollRealtimeInteraction(Speaker& speaker, uint32_t interactionId,
+                                 const PlaybackCallbacks& callbacks, const RealtimeDeadline& deadline);
+    bool acknowledgeRealtimeSegment(uint32_t interactionId, uint32_t sequence,
+                                    const RealtimeDeadline& deadline) const;
     bool sendDatasetRequest(WiFiClient& client,
                             const int16_t* pcm16,
                             size_t pcmByteCount,
@@ -116,10 +127,13 @@ private:
                                 size_t pcmByteCount,
                                 const CalibrationMetadata& metadata) const;
     static bool writeAll(WiFiClient& client, const uint8_t* data, size_t dataSize);
-    static int readStatusCode(WiFiClient& client);
+    static int readStatusCode(WiFiClient& client, const RealtimeDeadline* deadline = nullptr);
+    static String readHeaderLine(WiFiClient& client, const RealtimeDeadline* deadline);
     static int readResponseHeaders(WiFiClient& client, HttpResponseHeaders& headers,
-                                    void (*onProgress)() = nullptr);
-    static String readResponseBody(WiFiClient& client, void (*onProgress)() = nullptr);
+                                    void (*onProgress)() = nullptr,
+                                    const RealtimeDeadline* deadline = nullptr);
+    static String readResponseBody(WiFiClient& client, void (*onProgress)() = nullptr,
+                                   const RealtimeDeadline* deadline = nullptr);
     static bool parseWav(const uint8_t* wavData, size_t wavSize, WavInfo& wavInfo);
     static bool isHealthyResponse(const String& json);
     static bool extractText(const String& json, String& text);

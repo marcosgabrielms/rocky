@@ -1,12 +1,14 @@
 """Fronteira de integração para futuros modelos de linguagem."""
 
 from services.llm.base import ConversationMessage, LLMClient, LLMError, LLMResult, StreamingLLMClient
+from services.llm.chatgpt_plan import ChatGPTPlanLLMClient
 from services.llm.mock import MockLLMClient
 from services.llm.openrouter import OpenRouterLLMClient
 from services.llm.sentence_buffer import SentenceBuffer
 
 __all__ = [
     "ConversationMessage",
+    "ChatGPTPlanLLMClient",
     "LLMClient",
     "LLMError",
     "LLMResult",

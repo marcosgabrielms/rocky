@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from services.conversation import ConversationManager, InteractionKind, InteractionMode
-from services.llm import OpenRouterLLMClient
+from services.llm import ChatGPTPlanLLMClient
 from services.realtime_audio import RealtimeAudioService
 from services.stt import SAMPLE_RATE, transcribe as transcribe_audio, validate_wav
 from services.tts import LocalResponseSpeaker, PiperTTS, RealtimeTTS, get_local_playback_enabled
@@ -35,7 +35,7 @@ REALTIME_LONG_POLL_MAX_MS = 1000
 REALTIME_LONG_POLL_INTERVAL_MS = 50
 
 app = FastAPI()
-llm_client = OpenRouterLLMClient()
+llm_client = ChatGPTPlanLLMClient()
 conversation_manager = ConversationManager(0, llm_client)
 tts_client = PiperTTS(TTS_MODEL_PATH)
 response_speaker = LocalResponseSpeaker(

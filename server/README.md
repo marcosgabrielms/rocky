@@ -229,10 +229,10 @@ integros para limpeza. Frases vazias nao geram WAV e a sequencia de audio
 continua contigua, com o mesmo protocolo de ACK e AudioQueue.
 
 O prompt orienta uma frase curta para perguntas simples e no maximo duas para
-explicacoes comuns; mais detalhes somente quando pedidos. A politica atual usa
-`max_tokens=120`, `temperature=0.2` e Ling 3.1 Flash como unico modelo padrao,
-sem fallback automatico entre modelos, retry Python ou chamada extra de resumo. O modelo roteado vem
-da propria resposta/SSE.
+explicacoes comuns; mais detalhes somente quando pedidos. O provider padrao e o
+ChatGPT Plan autenticado localmente, com `gpt-5.6-terra`, `instructions` para a
+personalidade e contexto local enviado em `input`. Cada request usa Responses
+com `store=false`, `stream=true`, `max_retries=0` e sem fallback automatico.
 Logs temporarios de texto usam `SPEECH_TEXT_DIAGNOSTICS` e previews limitados
 a 240 caracteres; nao incluem chave, tokens de autenticacao ou dados PCM.
 
@@ -240,7 +240,7 @@ Testes deterministas adicionais:
 
 ```powershell
 cd server
-.\.venv\Scripts\python.exe -m unittest test_speech_text test_conversation test_sentence_buffer test_realtime_audio test_realtime_streaming test_realtime_endpoint test_tts_response_speaker
+.\.venv\Scripts\python.exe -m unittest test_chatgpt_auth test_chatgpt_plan test_speech_text test_conversation test_sentence_buffer test_realtime_audio test_realtime_streaming test_realtime_endpoint test_tts_response_speaker
 ```
 
 Depois de reiniciar o backend atualizado e fazer flash manual, validar:
@@ -249,7 +249,7 @@ Koda -> pergunta iniciada perto de 5,9 s -> captura command, sem expirar no STT;
 Koda -> Que horas sao? -> comando deterministico sem LLM;
 Koda -> Quem criou o Linux? -> resposta curta, sem Markdown/metatexto no audio.
 
-### Modelo padrao, custo zero e wake passiva (politica atual)
+### ChatGPT Plan padrao e OpenRouter legado
 
 A unica wake e `Koda` (caixa/pontuacao), pronunciada Kôda. `Ok Koda`, `Ei Koda`,
 `Coda`, `Kodal`, `Rocky` e Koda no meio de uma frase nao ativam em Idle.
@@ -265,10 +265,14 @@ token significativo precisa ser exatamente Koda; nao ha fuzzy/substring nem
 whitelist de perguntas. Qualquer pergunta valida pos-wake segue ao LLM se nao
 for comando conhecido. O prefixo de wake nao entra no contexto de conversa.
 
-Sem `OPENROUTER_MODEL`, o unico modelo padrao e `inclusionai/ling-3.1-flash`.
-Gemma (`google/gemma-4-31b-it:free`) permanece na allowlist apenas como
-alternativa manual para diagnostico. Os probes reais observaram HTTP 429 no
-Google AI Studio; ele nao e default nem fallback automatico do Ling.
+O caminho padrao usa Continue with ChatGPT e a sessao DPAPI do Windows. O
+launcher restaura ou renova a sessao antes de iniciar o backend; nao pede chave
+OpenRouter. Se a sessao precisar de novo login durante uma interacao, a chamada
+falha de forma controlada: o navegador nao abre no fluxo de voz.
+
+`server/services/llm/openrouter.py` permanece como alternativa legada para
+desenvolvimento, mas nao e provider padrao nem fallback automatico do ChatGPT
+Plan. As politicas abaixo descrevem somente esse caminho legado.
 
 Ling 3.1 Flash atualmente tem entrada e saida gratuitas, mesmo sem `:free` no
 slug. Isso nao garante gratuidade futura: `max_price=0` preserva custo zero e
@@ -277,13 +281,11 @@ por `data_collection=deny`.
 
 `openrouter/free`, `openrouter/auto`, modelos pagos, outros `:free` e configuracao
 vazia sao bloqueados antes da request. `OPENROUTER_MODEL` continua sendo um
-override manual de UM dos dois modelos autorizados: somente ele e enviado,
-sem fallback entre modelos. O launcher pergunta pelo Ling com preco maximo zero e remove o override apenas
-do processo atual; para selecionar um unico modelo manualmente, configure a
-variavel no PowerShell e inicie Uvicorn diretamente com o ambiente restaurado.
-Nao ha configuracao persistente ou leitura de .env no launcher.
+override manual de UM dos dois modelos autorizados, usado apenas ao iniciar o
+caminho legado explicitamente no desenvolvimento. Nao ha configuracao
+persistente nem leitura de `.env` pelo launcher.
 
-A request padrao usa somente o campo singular `model`, nunca `models`, e inclui:
+A request legada usa somente o campo singular `model`, nunca `models`, e inclui:
 
 ```json
 {

@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
 $rockyDeviceId = "VID_1A86&PID_55D3"
 $serverPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\server"))
@@ -20,7 +20,7 @@ if ($null -eq $rockyDevice) {
 }
 
 do {
-    $answer = Read-Host "Rocky conectado. Deseja iniciar a API do Rocky? [S/N]"
+    $answer = Read-Host "Rocky conectado. Deseja iniciar a API do Koda? [S/N]"
     switch ($answer.Trim().ToUpperInvariant()) {
         "S" { $startApi = $true }
         "N" { $startApi = $false }
@@ -30,45 +30,6 @@ do {
 
 if (-not $startApi) {
     Write-Host "Inicialização cancelada."
-    exit 0
-}
-
-do {
-    $answer = Read-Host "Usar Ling 3.1 Flash no Koda com preço máximo zero? [S/N]"
-    switch ($answer.Trim().ToUpperInvariant()) {
-        "S" { $useRockyModel = $true }
-        "N" { $useRockyModel = $false }
-        default { Write-Host "Resposta inválida. Digite S ou N." }
-    }
-} while ($null -eq $useRockyModel)
-
-if (-not $useRockyModel) {
-    Write-Host "Inicialização cancelada."
-    exit 0
-}
-
-# Sem override, o backend usa Ling; altera somente este processo.
-$env:OPENROUTER_MODEL = $null
-$secureApiKey = Read-Host "Cole sua chave OpenRouter" -AsSecureString
-$apiKeyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureApiKey)
-try {
-    $env:OPENROUTER_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($apiKeyPointer)
-}
-finally {
-    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($apiKeyPointer)
-}
-
-if ([string]::IsNullOrWhiteSpace($env:OPENROUTER_API_KEY)) {
-    Write-Host "A chave OpenRouter não pode ficar vazia."
-    exit 1
-}
-
-$portInUse = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() |
-    Where-Object { $_.Port -eq 8000 } |
-    Select-Object -First 1
-
-if ($null -ne $portInUse) {
-    Write-Host "A porta TCP 8000 já está em uso. A API não foi iniciada."
     exit 0
 }
 
@@ -82,9 +43,14 @@ if (-not (Test-Path -LiteralPath $pythonPath)) {
     exit 1
 }
 
-Write-Host "Iniciando a API do Rocky em http://0.0.0.0:8000"
 Push-Location $serverPath
 try {
+    & $pythonPath -B (Join-Path $serverPath "tools\chatgpt_auth.py")
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[KODA] A API não foi iniciada: sessão ChatGPT indisponível."
+        exit 1
+    }
+    Write-Host "[KODA] Iniciando backend..."
     & $pythonPath -m uvicorn app:app --host 0.0.0.0 --port 8000
 }
 finally {

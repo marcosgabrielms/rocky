@@ -314,8 +314,8 @@ class ConversationManager:
         print(f"[RT] sentences={sentence_count}")
 
     def _unavailable_llm_response(self, error: LLMError) -> BackendResponse:
-        print(f"[LLM] free model unavailable error={error}")
-        print("[LLM] paid fallback disabled")
+        print(f"[LLM] provider unavailable error={error}")
+        print("[LLM] provider fallback disabled")
         return self._idle_llm_response(LLM_UNAVAILABLE_MESSAGE)
 
     def _get_context(self, device_id: str, now: float) -> tuple[ConversationMessage, ...]:

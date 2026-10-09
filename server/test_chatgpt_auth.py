@@ -121,6 +121,16 @@ class ChatGPTAuthTest(unittest.TestCase):
             self.session.access_token_for_inference()
         self.oauth.login.assert_not_called()
 
+    def test_pending_rotation_reports_a_safe_reauthentication_reason(self):
+        self.save()
+        self.session.pending_path.write_text("rotating\n", encoding="ascii")
+
+        with self.assertRaisesRegex(AuthError, "refresh_rotation_pending"):
+            self.session.access_token_for_inference()
+
+        self.oauth.refresh.assert_not_called()
+        self.oauth.login.assert_not_called()
+
     def test_near_expiry_refreshes(self):
         self.save(expires=NOW + 30)
         self.assertEqual(self.session.ensure(), "refreshed")

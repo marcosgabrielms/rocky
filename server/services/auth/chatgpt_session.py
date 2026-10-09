@@ -142,8 +142,10 @@ class ChatGPTSession:
                 raise AuthError("authentication_required") from None
 
             credentials = self._restore(record, profile)
-            if credentials is None or self.pending_path.exists():
+            if credentials is None:
                 raise AuthError("authentication_required")
+            if self.pending_path.exists():
+                raise AuthError("refresh_rotation_pending")
 
             now = self.clock()
             if now < credentials.expires_at - REFRESH_MARGIN_SECONDS:

@@ -153,6 +153,19 @@ class ChatGPTPlanLLMClientTest(unittest.TestCase):
         factory.client.responses.create.assert_not_called()
         session.login.assert_not_called()
 
+    def test_pending_rotation_is_logged_without_creating_a_client_or_exposing_a_token(self):
+        session = Mock()
+        session.access_token_for_inference.side_effect = AuthError("refresh_rotation_pending")
+        client, factory = self.build_client(session=session)
+        output = io.StringIO()
+
+        with redirect_stdout(output), self.assertRaisesRegex(LLMError, "authentication is required"):
+            tuple(client.stream_response("Pergunta"))
+
+        self.assertIn("auth_error=refresh_rotation_pending", output.getvalue())
+        self.assertNotIn("oauth-access-token", output.getvalue())
+        factory.client.responses.create.assert_not_called()
+
     def test_sdk_failure_is_sanitized_and_never_falls_back_to_openrouter(self):
         client, factory = self.build_client()
         factory.client.responses.create.side_effect = RuntimeError("oauth-access-token SECRET")

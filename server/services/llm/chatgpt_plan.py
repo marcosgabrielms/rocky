@@ -22,6 +22,7 @@ PLAN_ERROR_CODES = frozenset({
     "subscription_sharing_user_unavailable",
     "chatpass_v2_scope_not_authorized",
     "chatpass_v2_invalid_authorization_context",
+    "refresh_rotation_pending",
 })
 
 

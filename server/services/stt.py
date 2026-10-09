@@ -2,6 +2,7 @@
 
 import io
 import wave
+from dataclasses import dataclass
 from functools import lru_cache
 
 from fastapi import HTTPException
@@ -23,6 +24,19 @@ STT_DIAGNOSTICS = False
 BEAM_SIZE = 5
 BEST_OF = 5
 CONDITION_ON_PREVIOUS_TEXT = True
+
+
+@dataclass(frozen=True)
+class TranscriptionResult:
+    """Texto reconhecido e o sinal minimo de confianca do Whisper."""
+
+    text: str
+    has_speech: bool
+    low_confidence: bool
+
+    @property
+    def accepted_text(self) -> str:
+        return self.text if self.has_speech and not self.low_confidence else ""
 
 
 @lru_cache
@@ -47,20 +61,29 @@ def report_transcription_diagnostics(
     print(f"[STT DIAG] decision={'accepted' if accepted else 'rejected'}")
 
 
-def get_confident_text(segments: list[object], duration: float, duration_after_vad: float) -> str:
+def assess_transcription(
+    segments: list[object], duration: float, duration_after_vad: float
+) -> TranscriptionResult:
     text = "".join(segment.text for segment in segments).strip()
     all_low_confidence = bool(segments) and all(
         segment.no_speech_prob > NO_SPEECH_PROBABILITY_THRESHOLD
         and segment.avg_logprob < AVG_LOGPROB_THRESHOLD
         for segment in segments
     )
-    accepted = bool(segments) and duration_after_vad > 0 and bool(text) and not all_low_confidence
+    has_speech = bool(segments) and duration_after_vad > 0 and bool(text)
+    accepted = has_speech and not all_low_confidence
     report_transcription_diagnostics(segments, duration, duration_after_vad, accepted)
+    return TranscriptionResult(text=text if has_speech else "", has_speech=has_speech,
+                               low_confidence=all_low_confidence)
 
-    return text if accepted else ""
+
+def get_confident_text(segments: list[object], duration: float, duration_after_vad: float) -> str:
+    return assess_transcription(segments, duration, duration_after_vad).accepted_text
 
 
-def transcribe(audio_data: bytes, filename: str | None, use_wake_hotword: bool) -> str:
+def transcribe_with_quality(
+    audio_data: bytes, filename: str | None, use_wake_hotword: bool
+) -> TranscriptionResult:
     audio_buffer = io.BytesIO(audio_data)
     audio_buffer.name = filename or "rocky.wav"
     hotwords = "Koda" if use_wake_hotword else None
@@ -80,11 +103,15 @@ def transcribe(audio_data: bytes, filename: str | None, use_wake_hotword: bool) 
             word_timestamps=False,
             initial_prompt=None,
         )
-        return get_confident_text(list(segments), info.duration, info.duration_after_vad)
+        return assess_transcription(list(segments), info.duration, info.duration_after_vad)
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail="Não foi possível transcrever o áudio.") from error
     finally:
         audio_buffer.close()
+
+
+def transcribe(audio_data: bytes, filename: str | None, use_wake_hotword: bool) -> str:
+    return transcribe_with_quality(audio_data, filename, use_wake_hotword).accepted_text
 
 
 def validate_wav(audio_data: bytes) -> float:

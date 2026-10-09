@@ -38,7 +38,7 @@ class _ConversationDouble:
         return False
 
     def classify(self, _text: str, _device_id: str, *, received_at: float | None = None,
-                 interaction_mode: InteractionMode | None = None) -> InteractionDecision:
+                 interaction_mode: InteractionMode | None = None, low_confidence: bool = False) -> InteractionDecision:
         self.classify_calls += 1
         self.received_at = received_at
         return self.decision
@@ -53,6 +53,8 @@ class _RealtimeAudioDouble:
     def __init__(self) -> None:
         self.create_calls = 0
         self.decisions: list[InteractionDecision] = []
+        self.direct_responses: list[tuple[dict[str, object], str]] = []
+        self.direct_interaction_id: int | None = None
         self.audio_queue = Mock(spec=RealtimeAudioQueue)
 
     def create_interaction(self) -> int:
@@ -65,6 +67,10 @@ class _RealtimeAudioDouble:
         self.decisions.append(decision)
         assert interaction_id == 42
         return SimpleNamespace(audio_segments=())
+
+    def queue_direct_response(self, response: dict[str, object], request_text: str) -> int | None:
+        self.direct_responses.append((dict(response), request_text))
+        return self.direct_interaction_id
 
 
 class RealtimeEndpointTest(TestCase):
@@ -145,6 +151,7 @@ class RealtimeEndpointTest(TestCase):
                     patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
                     patch.object(app, "validate_wav", return_value=1.0),
                     patch.object(app.response_speaker, "speak_response", return_value=False),
+                    patch.object(app.realtime_audio_service, "queue_direct_response", return_value=None),
                     patch("services.conversation.get_current_time", return_value="12:00"),
                 ):
                     response = TestClient(app.app).post(
@@ -173,17 +180,18 @@ class RealtimeEndpointTest(TestCase):
         return RealtimeAudioSegment(sequence, text, path, 32000, 1, 16, 1, path.stat().st_size)
 
     def post_with_decision(
-        self, decision: InteractionDecision, response: dict[str, object] | None = None
+        self, decision: InteractionDecision, response: dict[str, object] | None = None,
+        direct_interaction_id: int | None = None,
     ) -> tuple[object, _ConversationDouble, _RealtimeAudioDouble]:
         conversation = _ConversationDouble(decision, response or {"text": "", "interaction_state": "idle", "actions": []})
         realtime_audio = _RealtimeAudioDouble()
+        realtime_audio.direct_interaction_id = direct_interaction_id
         with (
             patch.object(app, "conversation_manager", conversation),
             patch.object(app, "realtime_audio_service", realtime_audio),
             patch.object(app, "transcribe_audio", return_value=decision.text),
             patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
             patch.object(app, "validate_wav", return_value=1.0),
-            patch.object(app.response_speaker, "speak_response", return_value=False),
             patch.object(app, "Thread", _ImmediateThread),
         ):
             response_http = TestClient(app.app).post(
@@ -217,16 +225,20 @@ class RealtimeEndpointTest(TestCase):
         self.assertEqual(conversation.classify_calls, 1)
         self.assertEqual(realtime_audio.create_calls, 0)
 
-    def test_deterministic_returns_sync_without_interaction(self) -> None:
+    def test_deterministic_uses_realtime_interaction_without_local_playback(self) -> None:
         direct = {"text": "horas", "interaction_state": "idle", "actions": [{"type": "show_text", "line1": "Agora sao", "line2": "12:00", "duration_ms": 3000}]}
         decision = InteractionDecision(InteractionKind.DETERMINISTIC, "horas", "rocky-01", direct)
 
-        response, conversation, realtime_audio = self.post_with_decision(decision, direct)
+        with patch.object(app.response_speaker, "speak_response") as local_playback:
+            response, conversation, realtime_audio = self.post_with_decision(decision, direct, 84)
 
-        self.assertFalse(response.json()["realtime"])
+        self.assertTrue(response.json()["realtime"])
+        self.assertEqual(response.json()["interaction_id"], 84)
         self.assertEqual(response.json()["actions"][0]["type"], "show_text")
         self.assertEqual(conversation.execute_calls, 1)
         self.assertEqual(realtime_audio.create_calls, 0)
+        self.assertEqual(realtime_audio.direct_responses, [(direct, "horas")])
+        local_playback.assert_not_called()
 
     def test_llm_creates_one_interaction_and_passes_the_same_decision_to_thread(self) -> None:
         decision = InteractionDecision(InteractionKind.LLM, "Pergunta aberta", "rocky-01")

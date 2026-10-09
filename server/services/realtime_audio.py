@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from models.actions import BackendResponse
 from services.audio_queue import RealtimeAudioQueue
 from services.conversation import (
     ConversationManager, InteractionDecision, StreamedConversationResponse,
@@ -9,6 +10,7 @@ from services.conversation import (
 )
 from services.tts.realtime import RealtimeAudioSegment, RealtimeTTS, RealtimeTTSSession
 from services.latency import latency_metric, mark_latency
+from services.tts.response_speaker import get_spoken_text
 from services.tts.speech_text import SpeechTextSanitizer, log_speech_text
 
 
@@ -46,6 +48,31 @@ class RealtimeAudioService:
         except Exception as error:
             print(f"[RT] cleanup_error type={type(error).__name__}")
         return interaction_id
+
+    def queue_direct_response(self, response: BackendResponse, request_text: str) -> int | None:
+        """Enfileira uma resposta deterministica sem usar playback local do Windows."""
+        spoken_text = get_spoken_text(response, request_text)
+        if spoken_text is None:
+            return None
+
+        spoken_text = SpeechTextSanitizer().sanitize(spoken_text)
+        if not spoken_text:
+            return None
+
+        interaction_id = self.create_interaction()
+        try:
+            session = self._realtime_tts.begin_interaction(
+                interaction_id, self._audio_queue.ready_audio_paths(),
+            )
+            segment = session.synthesize(spoken_text, 0)
+            self._audio_queue.enqueue(interaction_id, segment)
+            self._audio_queue.finish_if_active(interaction_id, failed=False)
+            print(f"[RT] deterministic_audio_ready id={interaction_id}")
+            return interaction_id
+        except Exception as error:
+            self._audio_queue.finish_if_active(interaction_id, failed=True)
+            print(f"[RT] deterministic_tts_error type={type(error).__name__}")
+            return None
 
     def build_stream_audio_response(
         self, text: str, device_id: str, interaction_id: int | None = None

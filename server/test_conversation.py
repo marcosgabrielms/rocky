@@ -15,6 +15,7 @@ from services.conversation import (
     LLM_UNAVAILABLE_MESSAGE,
     MAX_CONTEXT_MESSAGES,
     ConversationManager,
+    canonical_wake_word,
 )
 from services.llm import ConversationMessage, LLMError, LLMResult, OpenRouterLLMClient
 from services.latency import LatencyTrace, latency_scope
@@ -78,12 +79,17 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(response["actions"], [])
 
     def test_accepts_koda_without_ok_and_with_punctuation(self) -> None:
-        for text in ("Koda", "Koda.", "Koda?", "koda", "KODA", "  Koda!  "):
+        for text in ("Koda", "Koda.", "Koda?", "koda", "KODA", "Kôda", "KÔDA", "  Koda!  "):
             with self.subTest(text=text):
                 self.assert_wake(text)
 
+    def test_koda_and_koda_with_circumflex_share_the_same_canonical_wake(self) -> None:
+        self.assertEqual(canonical_wake_word("Koda"), "koda")
+        self.assertEqual(canonical_wake_word("Kôda"), "koda")
+        self.assertEqual(canonical_wake_word("KÔDA"), "koda")
+
     def test_rejects_legacy_wake_and_similar_words(self) -> None:
-        for text in ("Rocky", "Ok Rocky", "Ok Koda", "Ei Koda", "alguma coisa", "Coda", "Kôda", "Calma",
+        for text in ("Rocky", "Ok Rocky", "Ok Koda", "Ei Koda", "alguma coisa", "Coda", "Calma",
                      "Kodal", "Koda123", "Koda_nome", "Eu falei Koda ontem.", "O nome dele é Koda."):
             with self.subTest(text=text):
                 self.assert_not_wake(text)
@@ -171,6 +177,68 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(decision.kind, InteractionKind.DETERMINISTIC)
         self.assertEqual(response["actions"][0]["type"], "show_text")
         self.assertEqual(self.llm_client.calls, [])
+
+    def test_non_speech_after_wake_preserves_attention_without_calling_llm(self) -> None:
+        self.wake()
+
+        response = self.conversation.build_response("", "rocky-01", interaction_mode=InteractionMode.COMMAND)
+
+        self.assertEqual(response["interaction_state"], "attention")
+        self.assertEqual(response["actions"], [])
+        self.assertTrue(self.conversation.has_active_command_window("rocky-01"))
+        self.assertEqual(self.llm_client.calls, [])
+
+    def test_filler_after_wake_preserves_attention_without_calling_llm(self) -> None:
+        self.wake()
+
+        response = self.conversation.build_response("aham", "rocky-01", interaction_mode=InteractionMode.COMMAND)
+
+        self.assertEqual(response["interaction_state"], "attention")
+        self.assertEqual(response["actions"], [])
+        self.assertTrue(self.conversation.has_active_command_window("rocky-01"))
+        self.assertEqual(self.llm_client.calls, [])
+
+    def test_low_confidence_post_wake_text_preserves_attention_without_calling_llm(self) -> None:
+        self.wake()
+
+        response = self.conversation.build_response(
+            "e", "rocky-01", interaction_mode=InteractionMode.COMMAND, low_confidence=True,
+        )
+
+        self.assertEqual(response["interaction_state"], "attention")
+        self.assertEqual(response["actions"], [])
+        self.assertTrue(self.conversation.has_active_command_window("rocky-01"))
+        self.assertEqual(self.llm_client.calls, [])
+
+    def test_non_lexical_vocalization_after_wake_preserves_attention_without_calling_llm(self) -> None:
+        for text in ("kkkkkkkkkkkk", "aaaaaaa", "mmmmmmmm", "hhhhhhhh"):
+            with self.subTest(text=text):
+                self.wake()
+                response = self.conversation.build_response(text, "rocky-01", interaction_mode=InteractionMode.COMMAND)
+
+                self.assertEqual(response["interaction_state"], "attention")
+                self.assertEqual(response["actions"], [])
+                self.assertTrue(self.conversation.has_active_command_window("rocky-01"))
+                self.assertEqual(self.llm_client.calls, [])
+
+    def test_valid_single_word_command_after_wake_remains_available(self) -> None:
+        self.wake()
+
+        response = self.conversation.build_response("azul", "rocky-01", interaction_mode=InteractionMode.COMMAND)
+
+        self.assertEqual(response["interaction_state"], "idle")
+        self.assertEqual(self.llm_client.calls, [("azul", ())])
+
+    def test_confident_question_after_wake_remains_eligible_for_llm(self) -> None:
+        self.wake()
+
+        response = self.conversation.build_response(
+            "Qual e a capital do Brasil?", "rocky-01", interaction_mode=InteractionMode.COMMAND,
+            low_confidence=False,
+        )
+
+        self.assertEqual(response["interaction_state"], "idle")
+        self.assertEqual(self.llm_client.calls, [("Qual e a capital do Brasil?", ())])
 
     def test_natural_hours_variants_remain_deterministic_in_both_execution_paths(self) -> None:
         variants = (

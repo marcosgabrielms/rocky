@@ -467,6 +467,24 @@ class RealtimeAudioTest(unittest.TestCase):
         self.assertEqual(tts.calls, [])
         self.assertEqual(result.conversation.response["actions"][0]["type"], "show_text")
 
+    def test_deterministic_response_uses_the_realtime_audio_queue_without_llm(self) -> None:
+        service, llm, tts = self.build_service(("Não deve ser usado.",))
+        response = {
+            "text": "hora",
+            "interaction_state": "idle",
+            "actions": [{"type": "show_text", "line1": "Agora sao", "line2": "12:00", "duration_ms": 3000}],
+        }
+
+        interaction_id = service.queue_direct_response(response, "hora")
+
+        self.assertIsNotNone(interaction_id)
+        self.assertEqual(llm.stream_calls, 0)
+        self.assertEqual(tts.calls, ["Agora sao 12:00"])
+        item = service.audio_queue.next_item(interaction_id)
+        self.assertIsNotNone(item)
+        self.assertEqual(item.text, "Agora sao 12:00")
+        self.assertEqual(service.audio_queue.state(interaction_id).production_status, AudioProductionStatus.COMPLETED)
+
     def test_new_interaction_preserves_wav_that_is_still_queued(self) -> None:
         service, _, _ = self.build_service(("Primeira.",))
         self.wake(service, "cleanup")

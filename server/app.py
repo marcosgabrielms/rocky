@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from services.conversation import ConversationManager, InteractionKind, InteractionMode
 from services.llm import ChatGPTPlanLLMClient
 from services.realtime_audio import RealtimeAudioService
-from services.stt import SAMPLE_RATE, transcribe as transcribe_audio, validate_wav
+from services.stt import SAMPLE_RATE, TranscriptionResult, transcribe_with_quality as transcribe_audio, validate_wav
 from services.tts import LocalResponseSpeaker, PiperTTS, RealtimeTTS, get_local_playback_enabled
 from services.audio_queue import AudioProductionStatus
 from services.latency import latency_metric, latency_scope, mark_latency, report_latency
@@ -49,6 +49,16 @@ realtime_audio_service = RealtimeAudioService(
 )
 
 
+def _conversation_input(
+    transcription: TranscriptionResult | str, use_wake_hotword: bool
+) -> tuple[str, bool]:
+    """Mantem mocks legados e so entrega texto de baixa confianca apos a wake."""
+    if isinstance(transcription, str):
+        return transcription, False
+    text = transcription.accepted_text if use_wake_hotword else transcription.text
+    return text, transcription.low_confidence
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -77,12 +87,14 @@ async def _transcribe(
     use_wake_hotword = _use_wake_hotword(x_rocky_device, interaction_mode)
     print(f"[STT] mode={'wake' if use_wake_hotword else 'command'}")
     mark_latency("stt_start")
-    text = transcribe_audio(audio_data, file.filename, use_wake_hotword)
+    transcription = transcribe_audio(audio_data, file.filename, use_wake_hotword)
+    text, low_confidence = _conversation_input(transcription, use_wake_hotword)
     mark_latency("stt_done")
     latency_metric("stt_ms", "stt_start", "stt_done")
     print("[STT] transcription completed")
     response = conversation_manager.build_response(
-        text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode
+        text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode,
+        low_confidence=low_confidence,
     )
     response["audio_available"] = response_speaker.speak_response(response, text)
     return response
@@ -109,17 +121,24 @@ async def _transcribe_realtime(
     print(f"[RTD] wav duration={duration_seconds:.1f}s")
     use_wake_hotword = _use_wake_hotword(x_rocky_device, interaction_mode)
     mark_latency("stt_start")
-    text = transcribe_audio(audio_data, file.filename, use_wake_hotword)
+    transcription = transcribe_audio(audio_data, file.filename, use_wake_hotword)
+    text, low_confidence = _conversation_input(transcription, use_wake_hotword)
     mark_latency("stt_done")
     latency_metric("stt_ms", "stt_start", "stt_done")
     decision = conversation_manager.classify(
-        text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode
+        text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode,
+        low_confidence=low_confidence,
     )
     print(f"[RTD] classify kind={decision.kind}")
     if decision.kind is not InteractionKind.LLM:
         response = conversation_manager.build_response_from_decision(decision)
-        response["audio_available"] = response_speaker.speak_response(response, text)
-        return {"realtime": False, "interaction_id": None, **response}
+        interaction_id = realtime_audio_service.queue_direct_response(response, text)
+        return {
+            "realtime": interaction_id is not None,
+            "interaction_id": interaction_id,
+            **response,
+            "audio_available": False,
+        }
 
     interaction_id = realtime_audio_service.create_interaction()
     print(f"[RTD] interaction_created id={interaction_id}")

@@ -58,6 +58,14 @@ class SttConfidenceTest(unittest.TestCase):
             text = stt.transcribe(b"audio", "rocky.wav", use_wake_hotword=True)
         return text, model
 
+    def transcribe_with_quality(
+        self, segments: list[SimpleNamespace], duration_after_vad: float
+    ) -> tuple[stt.TranscriptionResult, FakeModel]:
+        model = FakeModel(segments, duration_after_vad)
+        with patch("services.stt.get_model", return_value=model):
+            result = stt.transcribe_with_quality(b"audio", "rocky.wav", use_wake_hotword=False)
+        return result, model
+
     def test_rejects_empty_segments(self) -> None:
         text, _ = self.transcribe_with([], duration_after_vad=1.0)
 
@@ -83,6 +91,21 @@ class SttConfidenceTest(unittest.TestCase):
         )
 
         self.assertEqual(text, "")
+
+    def test_preserves_low_confidence_signal_for_post_wake_routing(self) -> None:
+        result, _ = self.transcribe_with_quality([segment("e", 0.7, -1.1)], duration_after_vad=1.0)
+
+        self.assertEqual(result.text, "e")
+        self.assertTrue(result.has_speech)
+        self.assertTrue(result.low_confidence)
+        self.assertEqual(result.accepted_text, "")
+
+    def test_preserves_confident_short_command(self) -> None:
+        result, _ = self.transcribe_with_quality([segment("hora", 0.1, -0.2)], duration_after_vad=1.0)
+
+        self.assertEqual(result.text, "hora")
+        self.assertFalse(result.low_confidence)
+        self.assertEqual(result.accepted_text, "hora")
 
     def test_preserves_text_with_a_confident_segment(self) -> None:
         text, model = self.transcribe_with(

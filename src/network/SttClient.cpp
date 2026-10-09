@@ -167,6 +167,8 @@ bool SttClient::transcribeRealtime(const int16_t* pcm16, size_t pcmByteCount, Re
     {
         if (!extractJsonUnsigned(body, "interaction_id", response.interactionId))
             return false;
+        if (!extractBackendResponse(body, response.backendResponse))
+            return false;
     }
     else if (!extractBackendResponse(body, response.backendResponse))
         return false;

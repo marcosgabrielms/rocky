@@ -16,43 +16,49 @@ void Animator::begin()
 void Animator::update()
 {
     const uint32_t now = millis();
-    if (visualState == Eyes::VisualState::Speaking)
-        updateSpeaking(now);
-    else
+    if (visualState == Eyes::VisualState::Idle)
     {
         updateBlink(now);
-        updateGaze(now);
+        updateIdleGaze(now);
     }
+    else if (visualState == Eyes::VisualState::Attention)
+        updateAttention(now);
+    else if (visualState == Eyes::VisualState::Listening)
+        updateListening(now);
+    else if (visualState == Eyes::VisualState::Thinking)
+        updateThinking(now);
+    else if (visualState == Eyes::VisualState::Speaking)
+        updateSpeaking(now);
     eyes.update(now);
 }
 
 void Animator::setVisualState(Eyes::VisualState newState, bool showConfirmation)
 {
     if (visualState == newState)
+    {
+        eyes.render();
         return;
+    }
 
     visualState = newState;
     eyes.setVisualState(newState, showConfirmation);
 
-    if (visualState == Eyes::VisualState::Attention ||
-        visualState == Eyes::VisualState::Listening ||
-        visualState == Eyes::VisualState::Thinking ||
-        visualState == Eyes::VisualState::Speaking)
-    {
-        eyes.lookCenter();
+    const uint32_t now = millis();
+    blinkState = BlinkState::Waiting;
+    stateStartedAt = now;
+    lastGazeChangeAt = now;
+    lastPulseAt = now;
+    eyes.setBlinking(false);
+    eyes.setHeightOffset(0);
+    eyes.lookCenter();
 
-        if (visualState == Eyes::VisualState::Attention)
-            attentionGazeIndex = 0;
-    }
+    attentionPulseIndex = 1;
+    listeningPulseIndex = 1;
 
-    lastGazeChangeAt = millis();
     if (visualState == Eyes::VisualState::Speaking)
     {
         speakingPoseIndex = 0;
         lastSpeakingPoseAt = lastGazeChangeAt;
-        blinkState = BlinkState::Waiting;
-        stateStartedAt = lastGazeChangeAt;
-        eyes.setBlinking(false);
     }
     eyes.render();
 }
@@ -64,8 +70,26 @@ void Animator::updateSpeaking(uint32_t now)
 
     constexpr int16_t HEIGHT_OFFSETS[] = {0, -3, 0, 3};
     speakingPoseIndex = (speakingPoseIndex + 1) % 4;
-    eyes.setSpeakingHeightOffset(HEIGHT_OFFSETS[speakingPoseIndex]);
+    eyes.setHeightOffset(HEIGHT_OFFSETS[speakingPoseIndex]);
     lastSpeakingPoseAt = now;
+}
+
+void Animator::updateAttention(uint32_t now)
+{
+    if (now - lastPulseAt < ATTENTION_PULSE_STEP_MS)
+        return;
+
+    applyAttentionPulse();
+    lastPulseAt = now;
+}
+
+void Animator::updateListening(uint32_t now)
+{
+    if (now - lastPulseAt < LISTENING_PULSE_STEP_MS)
+        return;
+
+    applyListeningPulse();
+    lastPulseAt = now;
 }
 
 void Animator::updateBlink(uint32_t now)
@@ -95,30 +119,25 @@ void Animator::updateBlink(uint32_t now)
     }
 }
 
-void Animator::updateGaze(uint32_t now)
+void Animator::updateIdleGaze(uint32_t now)
 {
-    if (visualState == Eyes::VisualState::Attention && eyes.isAttentionConfirming())
+    if (now - lastGazeChangeAt < IDLE_GAZE_INTERVAL_MS)
         return;
 
-    if (visualState == Eyes::VisualState::Listening)
-        return;
-
-    const uint32_t interval = visualState == Eyes::VisualState::Attention
-                                  ? ATTENTION_GAZE_INTERVAL_MS
-                                  : GAZE_INTERVAL_MS;
-
-    if (now - lastGazeChangeAt < interval)
-        return;
-
-    if (visualState == Eyes::VisualState::Attention)
-        applyNextAttentionGaze();
-    else
-        applyNextGaze();
-
+    applyNextIdleGaze();
     lastGazeChangeAt = now;
 }
 
-void Animator::applyNextGaze()
+void Animator::updateThinking(uint32_t now)
+{
+    if (now - lastGazeChangeAt < THINKING_GAZE_INTERVAL_MS)
+        return;
+
+    applyNextThinkingGaze();
+    lastGazeChangeAt = now;
+}
+
+void Animator::applyNextIdleGaze()
 {
     switch (gazeIndex++ % 5)
     {
@@ -140,24 +159,33 @@ void Animator::applyNextGaze()
     }
 }
 
-void Animator::applyNextAttentionGaze()
+void Animator::applyNextThinkingGaze()
 {
-    switch (attentionGazeIndex++ % 5)
+    switch (gazeIndex++ % 4)
     {
     case 0:
-        eyes.setGazeOffset(-2, 0);
+        eyes.setGazeOffset(-4, -1);
         break;
     case 1:
-        eyes.setGazeOffset(1, -1);
+        eyes.setGazeOffset(2, -1);
         break;
     case 2:
-        eyes.setGazeOffset(2, 0);
-        break;
-    case 3:
-        eyes.setGazeOffset(-1, 1);
+        eyes.setGazeOffset(4, 1);
         break;
     default:
         eyes.lookCenter();
         break;
     }
+}
+
+void Animator::applyAttentionPulse()
+{
+    constexpr int16_t HEIGHT_OFFSETS[] = {0, 2, 4, 2};
+    eyes.setHeightOffset(HEIGHT_OFFSETS[attentionPulseIndex++ % 4]);
+}
+
+void Animator::applyListeningPulse()
+{
+    constexpr int16_t HEIGHT_OFFSETS[] = {0, 3};
+    eyes.setHeightOffset(HEIGHT_OFFSETS[listeningPulseIndex++ % 2]);
 }

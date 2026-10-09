@@ -37,7 +37,6 @@ namespace
 constexpr size_t MIC_BLOCK_SAMPLES = 64;
 constexpr uint32_t MIC_REPORT_INTERVAL_MS = 250;
 constexpr uint32_t HEALTH_CHECK_DELAY_MS = 500;
-constexpr uint32_t TIME_SCREEN_DURATION_MS = 3000;
 constexpr uint32_t ATTENTION_TIMEOUT_MS = 6000;
 constexpr bool SERIAL_VERBOSE_AUDIO = false;
 constexpr bool MIC_DIAGNOSTIC_MODE = false;
@@ -55,8 +54,7 @@ enum class InteractionState : uint8_t
     Idle,
     WaitingCommand,
     ProcessingCommand,
-    Speaking,
-    ShowingResponse
+    Speaking
 };
 
 enum class DiagnosticCaptureMode : uint8_t
@@ -174,7 +172,6 @@ int64_t micSum = 0;
 size_t micSampleCount = 0;
 uint32_t lastMicReportAt = 0;
 uint32_t wifiConnectedAt = 0;
-uint32_t timeScreenStartedAt = 0;
 uint32_t visualCommandWindowStartedAt = 0;
 uint32_t interactionId = 0;
 InteractionLatency interactionLatency;
@@ -200,9 +197,9 @@ bool diagnosticVadArmed = false;
 bool healthCheckAttempted = false;
 bool sttServerAvailable = false;
 bool timeSyncStarted = false;
-bool showingTime = false;
 bool backendConversationActive = false;
 bool visualCommandWindowActive = false;
+bool visualCommandWindowPausedForSpeech = false;
 bool capturedPostWakeCommand = false;
 InteractionState interactionState = InteractionState::Idle;
 Eyes::VisualState currentVisualState = Eyes::VisualState::Idle;
@@ -213,7 +210,6 @@ void beginSpeaking();
 void updateSpeakingVisual();
 void handleWakeWord(const String& text);
 void handleCommand(const String& text);
-void updateTimeScreen(uint32_t now);
 void updateCommandWindow(uint32_t now);
 void returnToIdle();
 void setVisualState(Eyes::VisualState state, bool showConfirmation = true);
@@ -628,16 +624,13 @@ void sendCompletedSpeech()
             {
                 sttClient.playResponseAudio(speaker, playbackCallbacks);
                 returnToIdle();
-                if (showingTime)
-                {
-                    display.showTime(realtimeResponse.backendResponse.action.line2);
-                    timeScreenStartedAt = millis();
-                }
             }
         }
         else
         {
             Serial.printf("[RT] interaction=%lu\n", static_cast<unsigned long>(realtimeResponse.interactionId));
+            if (realtimeResponse.backendResponse.action.type != SttClient::BackendAction::Type::None)
+                handleBackendResponse(realtimeResponse.backendResponse, true);
             if (!sttClient.playRealtimeInteraction(speaker, realtimeResponse.interactionId, playbackCallbacks))
                 Serial.println("[RT] interaction_failed");
             returnToIdle();
@@ -661,6 +654,7 @@ void beginSpeaking()
 
     interactionState = InteractionState::Speaking;
     visualCommandWindowActive = false;
+    visualCommandWindowPausedForSpeech = false;
     setVisualState(Eyes::VisualState::Speaking, false);
     interactionLatency.playback(millis());
 }
@@ -693,12 +687,7 @@ void handleBackendResponse(const SttClient::BackendResponse& response, bool defe
         if (response.action.line1 == "Agora sao")
         {
             visualCommandWindowActive = false;
-            display.showTime(response.action.line2);
-            showingTime = true;
-            interactionState = InteractionState::ShowingResponse;
-            timeScreenStartedAt = millis();
-            Serial.println("[BACKEND] action=show_text");
-            Serial.println("[DISPLAY] show_text start");
+            Serial.println("[BACKEND] action=show_text audio_only");
         }
         else
             Serial.println("[ACTION] unsupported=show_text");
@@ -708,21 +697,35 @@ void handleBackendResponse(const SttClient::BackendResponse& response, bool defe
 
     if (response.interactionState == "attention")
     {
+        const bool commandWindowWasActive = visualCommandWindowActive;
+        const bool resumePausedCommandWindow = visualCommandWindowPausedForSpeech;
         interactionState = InteractionState::WaitingCommand;
         backendConversationActive = true;
         setVisualState(Eyes::VisualState::Attention, false);
-        visualCommandWindowActive = true;
-        visualCommandWindowStartedAt = millis();
-        Serial.printf("[BODY] attention timeout started: %lums\n",
-                      static_cast<unsigned long>(ATTENTION_TIMEOUT_MS));
-        interactionLatency.attention(millis());
+        if (resumePausedCommandWindow)
+        {
+            visualCommandWindowActive = true;
+            visualCommandWindowPausedForSpeech = false;
+            Serial.println("[BODY] attention maintained");
+        }
+        else if (!commandWindowWasActive)
+        {
+            visualCommandWindowActive = true;
+            visualCommandWindowStartedAt = millis();
+            Serial.printf("[BODY] attention timeout started: %lums\n",
+                          static_cast<unsigned long>(ATTENTION_TIMEOUT_MS));
+            interactionLatency.attention(millis());
+        }
+        else
+            Serial.println("[BODY] attention maintained");
     }
     else if (response.interactionState == "idle")
     {
         interactionState = InteractionState::Idle;
         backendConversationActive = false;
         visualCommandWindowActive = false;
-        if (!deferVisualState && !showingTime)
+        visualCommandWindowPausedForSpeech = false;
+        if (!deferVisualState)
             setVisualState(Eyes::VisualState::Idle);
     }
     else if (response.interactionState != "idle")
@@ -790,20 +793,6 @@ void handleCommand(const String& text)
     }
 
     Serial.printf("[TIME] current=%s\n", currentTime.c_str());
-    display.showTime(currentTime);
-    showingTime = true;
-    interactionState = InteractionState::ShowingResponse;
-    timeScreenStartedAt = millis();
-    Serial.println("[DISPLAY] showing time");
-}
-
-void updateTimeScreen(uint32_t now)
-{
-    if (!showingTime || now - timeScreenStartedAt < TIME_SCREEN_DURATION_MS)
-        return;
-
-    showingTime = false;
-    Serial.println("[DISPLAY] show_text end");
     returnToIdle();
 }
 
@@ -825,6 +814,7 @@ void returnToIdle()
 {
     interactionState = InteractionState::Idle;
     visualCommandWindowActive = false;
+    visualCommandWindowPausedForSpeech = false;
     backendConversationActive = false;
     setVisualState(Eyes::VisualState::Idle);
 }
@@ -832,7 +822,10 @@ void returnToIdle()
 void setVisualState(Eyes::VisualState state, bool showConfirmation)
 {
     if (currentVisualState == state)
+    {
+        animator.setVisualState(state, showConfirmation);
         return;
+    }
 
     const auto stateName = [](Eyes::VisualState visualState) -> const char*
     {
@@ -921,7 +914,8 @@ void processMicrophoneSamples(const int32_t* samples, size_t sampleCount)
         if (visualCommandWindowActive)
         {
             visualCommandWindowActive = false;
-            Serial.println("[BODY] attention timeout cancelled by speech");
+            visualCommandWindowPausedForSpeech = true;
+            Serial.println("[BODY] attention timeout paused by speech");
         }
         Serial.println("[VAD] SILENCE -> SPEECH");
         if (!MIC_DIAGNOSTIC_MODE && interactionState == InteractionState::WaitingCommand)
@@ -1046,7 +1040,7 @@ void loop()
     else
         datasetCollector.update();
     updateCommandWindow(millis());
-    if (!showingTime && microphone.available())
+    if (microphone.available())
         processMicrophoneSamples(micSamples, microphone.readSamples(micSamples, MIC_BLOCK_SAMPLES));
 
     wifiManager.update();
@@ -1070,11 +1064,9 @@ void loop()
 
     if (!MIC_DIAGNOSTIC_MODE && !datasetCollector.isActive())
         timeService.update();
-    updateTimeScreen(millis());
     updateCommandWindow(millis());
     if constexpr (ATTENTION_VAD_DIAGNOSTICS)
         attentionVadDiagnostics.report(millis());
-    if (!showingTime)
-        animator.update();
+    animator.update();
     reportMicrophoneLevel(millis());
 }

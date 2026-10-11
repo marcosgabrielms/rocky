@@ -9,7 +9,8 @@ from services.conversation import (
     LLM_UNAVAILABLE_MESSAGE, LLM_INTERRUPTED_MESSAGE,
 )
 from services.tts.realtime import RealtimeAudioSegment, RealtimeTTS, RealtimeTTSSession
-from services.latency import latency_metric, mark_latency
+from services.latency import latency_metric, mark_latency, report_latency_summary
+from services.runtime_log import error as log_error, info, technical
 from services.tts.response_speaker import get_spoken_text
 from services.tts.speech_text import SpeechTextSanitizer, log_speech_text
 
@@ -46,7 +47,8 @@ class RealtimeAudioService:
         try:
             self._realtime_tts.cleanup_orphaned_audio(self._audio_queue.ready_audio_paths())
         except Exception as error:
-            print(f"[RT] cleanup_error type={type(error).__name__}")
+            log_error("Falha ao limpar áudio realtime.")
+            technical(f"[RT] cleanup_error type={type(error).__name__}")
         return interaction_id
 
     def queue_direct_response(self, response: BackendResponse, request_text: str) -> int | None:
@@ -67,11 +69,12 @@ class RealtimeAudioService:
             segment = session.synthesize(spoken_text, 0)
             self._audio_queue.enqueue(interaction_id, segment)
             self._audio_queue.finish_if_active(interaction_id, failed=False)
-            print(f"[RT] deterministic_audio_ready id={interaction_id}")
+            technical(f"[RT] deterministic_audio_ready id={interaction_id}")
             return interaction_id
         except Exception as error:
             self._audio_queue.finish_if_active(interaction_id, failed=True)
-            print(f"[RT] deterministic_tts_error type={type(error).__name__}")
+            log_error("Falha ao sintetizar resposta determinística.")
+            technical(f"[RT] deterministic_tts_error type={type(error).__name__}")
             return None
 
     def build_stream_audio_response(
@@ -85,6 +88,7 @@ class RealtimeAudioService:
     ) -> StreamedAudioResponse:
         session: RealtimeTTSSession | None = None
         segments: list[RealtimeAudioSegment] = []
+        conversation: StreamedConversationResponse | None = None
         tts_failed = False
         production_failed = True
         sanitizer = SpeechTextSanitizer()
@@ -100,7 +104,7 @@ class RealtimeAudioService:
             if not spoken_text:
                 return
 
-            print(f"[RT] sentence_ready seq={sequence} ms={ready_ms}")
+            technical(f"[RT] sentence_ready seq={sequence} ms={ready_ms}")
             try:
                 if interaction_id is None:
                     interaction_id = self.create_interaction()
@@ -118,7 +122,8 @@ class RealtimeAudioService:
                 segments.append(segment)
             except Exception as error:
                 tts_failed = True
-                print(f"[RT] tts_error seq={sequence} type={type(error).__name__}")
+                log_error("Falha ao sintetizar áudio realtime.")
+                technical(f"[RT] tts_error seq={sequence} type={type(error).__name__}")
 
         try:
             try:
@@ -126,7 +131,8 @@ class RealtimeAudioService:
                     decision, on_sentence=synthesize_sentence,
                 )
             except Exception as error:
-                print(f"[RT] producer_error type={type(error).__name__}")
+                log_error("Falha ao processar resposta realtime.")
+                technical(f"[RT] producer_error type={type(error).__name__}")
                 message = LLM_INTERRUPTED_MESSAGE if segments else LLM_UNAVAILABLE_MESSAGE
                 conversation = StreamedConversationResponse(
                     response={"text": message, "interaction_state": "idle", "actions": []},
@@ -140,6 +146,11 @@ class RealtimeAudioService:
             # BaseException continua propagando, mas nao deixa uma fila ACTIVE.
             if interaction_id is not None:
                 self._audio_queue.finish_if_active(interaction_id, failed=production_failed)
+            if conversation is not None and conversation.response.get("text"):
+                info(f'Resposta: "{conversation.response["text"]}"')
+            report_latency_summary()
+        if conversation is None:
+            raise RuntimeError("A resposta realtime não foi concluída.")
         return StreamedAudioResponse(
             conversation=conversation,
             audio_segments=tuple(segments),

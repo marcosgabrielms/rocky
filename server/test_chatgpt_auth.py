@@ -535,7 +535,7 @@ class LauncherAuthTest(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", script)
         self.assertNotIn("OPENROUTER_API_KEY", script)
         self.assertNotIn("Ling 3.1 Flash", script)
-        self.assertLess(script.index("chatgpt_auth.py"), script.index("-m uvicorn"))
+        self.assertLess(script.index("chatgpt_auth.py"), script.index("& $pythonPath @uvicornArguments"))
         self.assertIn("Deseja iniciar a API do Koda?", script)
         self.assertIn("[KODA] Iniciando backend...", script)
         self.assertNotIn("Fase 2B pendente", script)

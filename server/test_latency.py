@@ -1,9 +1,11 @@
 """Testes de relógio, isolamento e propagação do diagnóstico sem serviços reais."""
 
 import io
+import os
 import unittest
 from contextlib import redirect_stdout
 from contextvars import copy_context
+from unittest.mock import patch
 
 from services.latency import LatencyTrace, latency_metric, latency_scope, mark_latency
 
@@ -12,6 +14,11 @@ class LatencyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.now = 100.0
         self.output = io.StringIO()
+        self._verbose = patch.dict(os.environ, {"KODA_VERBOSE": "1"})
+        self._verbose.start()
+
+    def tearDown(self) -> None:
+        self._verbose.stop()
 
     def clock(self) -> float:
         return self.now
@@ -64,9 +71,7 @@ class LatencyTest(unittest.TestCase):
         self.assertIn(f"request={trace.request_id} kind=duration llm_first_token_ms=200", self.output.getvalue())
 
     def test_diagnostic_can_be_disabled_without_changing_measurements(self) -> None:
-        from unittest.mock import patch
-
-        with patch("services.latency.LATENCY_DIAGNOSTICS", False), redirect_stdout(self.output):
+        with patch.dict(os.environ, {"KODA_VERBOSE": "0"}), redirect_stdout(self.output):
             with latency_scope(self.clock):
                 self.assertTrue(mark_latency("stt_start"))
                 mark_latency("stt_done")

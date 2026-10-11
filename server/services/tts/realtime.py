@@ -10,6 +10,7 @@ from threading import Lock
 from services.tts.base import TTSClient
 from services.tts.response_speaker import SUPPORTED_SAMPLE_RATE, resample_wav
 from services.latency import latency_metric, mark_latency
+from services.runtime_log import technical
 
 ORPHAN_AUDIO_MAXIMUM_AGE_SECONDS = 300
 
@@ -86,7 +87,7 @@ class RealtimeTTS:
 
         output_path = self._output_directory / f"{self._FILENAME_PREFIX}{interaction_id:04d}_{sequence:03d}.wav"
         started_at = time.monotonic()
-        print(f"[RT] tts_start seq={sequence}")
+        technical(f"[RT] tts_start seq={sequence}")
         if sequence == 0:
             mark_latency("tts_start")
         with self._lock:
@@ -103,9 +104,9 @@ class RealtimeTTS:
         if sequence == 0:
             mark_latency("tts_ready")
             latency_metric("tts_first_sentence_ms", "tts_start", "tts_ready")
-        print(f"[RT] tts_ready seq={sequence} ms={elapsed_ms}")
-        print(f"[RT] tts_duration_ms={segment.duration_ms}")
-        print(f"[RT] audio_bytes={segment.audio_bytes}")
+        technical(f"[RT] tts_ready seq={sequence} ms={elapsed_ms}")
+        technical(f"[RT] tts_duration_ms={segment.duration_ms}")
+        technical(f"[RT] audio_bytes={segment.audio_bytes}")
         return segment
 
     @staticmethod

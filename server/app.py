@@ -20,7 +20,9 @@ from services.realtime_audio import RealtimeAudioService
 from services.stt import SAMPLE_RATE, TranscriptionResult, transcribe_with_quality as transcribe_audio, validate_wav
 from services.tts import LocalResponseSpeaker, PiperTTS, RealtimeTTS, get_local_playback_enabled
 from services.audio_queue import AudioProductionStatus
-from services.latency import latency_metric, latency_scope, mark_latency, report_latency
+from services.latency import latency_metric, latency_scope, mark_latency, report_latency, report_latency_summary
+from services.runtime_log import error as log_error, info, technical
+from services.tts.response_speaker import get_spoken_text
 
 
 MAX_UPLOAD_BYTES = 1024 * 1024
@@ -59,6 +61,25 @@ def _conversation_input(
     return text, transcription.low_confidence
 
 
+def _report_transcription_and_response(
+    text: str,
+    low_confidence: bool,
+    response: dict[str, object],
+    kind: InteractionKind | None = None,
+) -> None:
+    """Mostra apenas a conversa útil; descartes continuam disponíveis no verbose."""
+    if low_confidence or not text or response.get("interaction_state") == "attention":
+        return
+
+    spoken_text = get_spoken_text(response, text)
+    if kind is InteractionKind.EMPTY or (spoken_text is None and response.get("text") == text):
+        return
+
+    info(f'Ouvi: "{text}"')
+    if spoken_text:
+        info(f'Resposta: "{spoken_text}"')
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -81,22 +102,24 @@ async def _transcribe(
 ) -> dict[str, object]:
     audio_data = await read_wav_upload(file)
     duration_seconds = validate_wav(audio_data)
-    print("[STT] request received")
-    print(f"[STT] wav: {SAMPLE_RATE} Hz mono 16-bit duration={duration_seconds:.1f}s")
+    technical("[STT] request received")
+    technical(f"[STT] wav: {SAMPLE_RATE} Hz mono 16-bit duration={duration_seconds:.1f}s")
 
     use_wake_hotword = _use_wake_hotword(x_rocky_device, interaction_mode)
-    print(f"[STT] mode={'wake' if use_wake_hotword else 'command'}")
+    technical(f"[STT] mode={'wake' if use_wake_hotword else 'command'}")
     mark_latency("stt_start")
     transcription = transcribe_audio(audio_data, file.filename, use_wake_hotword)
     text, low_confidence = _conversation_input(transcription, use_wake_hotword)
     mark_latency("stt_done")
     latency_metric("stt_ms", "stt_start", "stt_done")
-    print("[STT] transcription completed")
+    technical("[STT] transcription completed")
     response = conversation_manager.build_response(
         text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode,
         low_confidence=low_confidence,
     )
+    _report_transcription_and_response(text, low_confidence, response)
     response["audio_available"] = response_speaker.speak_response(response, text)
+    report_latency_summary()
     return response
 
 
@@ -117,8 +140,8 @@ async def _transcribe_realtime(
 ) -> dict[str, object]:
     audio_data = await read_wav_upload(file)
     duration_seconds = validate_wav(audio_data)
-    print("[RTD] request received")
-    print(f"[RTD] wav duration={duration_seconds:.1f}s")
+    technical("[RTD] request received")
+    technical(f"[RTD] wav duration={duration_seconds:.1f}s")
     use_wake_hotword = _use_wake_hotword(x_rocky_device, interaction_mode)
     mark_latency("stt_start")
     transcription = transcribe_audio(audio_data, file.filename, use_wake_hotword)
@@ -129,10 +152,12 @@ async def _transcribe_realtime(
         text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode,
         low_confidence=low_confidence,
     )
-    print(f"[RTD] classify kind={decision.kind}")
+    technical(f"[RTD] classify kind={decision.kind}")
     if decision.kind is not InteractionKind.LLM:
         response = conversation_manager.build_response_from_decision(decision)
+        _report_transcription_and_response(text, low_confidence, response, decision.kind)
         interaction_id = realtime_audio_service.queue_direct_response(response, text)
+        report_latency_summary()
         return {
             "realtime": interaction_id is not None,
             "interaction_id": interaction_id,
@@ -141,14 +166,16 @@ async def _transcribe_realtime(
         }
 
     interaction_id = realtime_audio_service.create_interaction()
-    print(f"[RTD] interaction_created id={interaction_id}")
+    info(f'Ouvi: "{text}"')
+    technical(f"[RTD] interaction_created id={interaction_id}")
     report_latency("interaction_id", interaction_id)
 
     def produce() -> None:
         try:
             realtime_audio_service.build_stream_audio_response_from_decision(decision, interaction_id)
-        except Exception as error:
-            print(f"[RTD] producer_error type={type(error).__name__}")
+        except Exception as exception:
+            log_error("Falha ao gerar áudio realtime.")
+            technical(f"[RTD] producer_error type={type(exception).__name__}")
         finally:
             realtime_audio_service.audio_queue.finish_if_active(interaction_id, failed=True)
 
@@ -157,8 +184,9 @@ async def _transcribe_realtime(
     try:
         Thread(target=lambda: request_context.run(produce), name=f"rocky-realtime-{interaction_id}", daemon=True).start()
         thread_started = True
-    except Exception as error:
-        print(f"[RTD] thread_start_error type={type(error).__name__}")
+    except Exception as exception:
+        log_error("Falha ao iniciar áudio realtime.")
+        technical(f"[RTD] thread_start_error type={type(exception).__name__}")
     finally:
         if not thread_started:
             realtime_audio_service.audio_queue.finish_if_active(interaction_id, failed=True)
@@ -191,7 +219,7 @@ def get_next_realtime_audio(interaction_id: int, timeout_ms: int = REALTIME_LONG
             raise HTTPException(status_code=404, detail="Interacao realtime desconhecida.") from error
 
         if item is not None:
-            print(f"[RTD] served id={interaction_id} seq={item.sequence}")
+            technical(f"[RTD] served id={interaction_id} seq={item.sequence}")
             return FileResponse(
                 item.audio_path,
                 media_type="audio/wav",
@@ -207,14 +235,14 @@ def get_next_realtime_audio(interaction_id: int, timeout_ms: int = REALTIME_LONG
                 },
             )
         if state.production_status is AudioProductionStatus.COMPLETED:
-            print(f"[RTD] done id={interaction_id}")
+            technical(f"[RTD] done id={interaction_id}")
             return _realtime_status("done")
         if state.production_status is AudioProductionStatus.FAILED:
             return _realtime_status("failed")
         if state.production_status is AudioProductionStatus.CANCELLED:
             return _realtime_status("cancelled")
         if (time.monotonic() - started_at) * 1000 >= timeout_ms:
-            print(f"[RTD] next_wait_ms={round((time.monotonic() - started_at) * 1000)}")
+            technical(f"[RTD] next_wait_ms={round((time.monotonic() - started_at) * 1000)}")
             return _realtime_status("pending")
         time.sleep(REALTIME_LONG_POLL_INTERVAL_MS / 1000)
 
@@ -225,7 +253,7 @@ def acknowledge_realtime_audio(interaction_id: int, sequence: int) -> dict[str, 
         realtime_audio_service.audio_queue.mark_consumed(interaction_id, sequence)
     except ValueError as error:
         raise HTTPException(status_code=409, detail="ACK realtime invalido.") from error
-    print(f"[RTD] consumed id={interaction_id} seq={sequence}")
+    technical(f"[RTD] consumed id={interaction_id} seq={sequence}")
     return {"status": "consumed", "interaction_id": interaction_id, "sequence": sequence}
 
 
@@ -238,7 +266,7 @@ def get_response_audio() -> FileResponse:
     if not TTS_OUTPUT_PATH.is_file() or TTS_OUTPUT_PATH.stat().st_size == 0:
         raise HTTPException(status_code=404, detail="Audio indisponivel.")
 
-    print(f"[AUDIO] served path={TTS_OUTPUT_PATH.name} bytes={TTS_OUTPUT_PATH.stat().st_size}")
+    technical(f"[AUDIO] served path={TTS_OUTPUT_PATH.name} bytes={TTS_OUTPUT_PATH.stat().st_size}")
     return FileResponse(TTS_OUTPUT_PATH, media_type="audio/wav")
 
 
@@ -253,9 +281,9 @@ async def save_dataset(file: UploadFile | None = File(default=None), label: str 
     duration_seconds = validate_wav(audio_data)
     destination = save_unique_dataset_file(label, audio_data)
     index = int(destination.stem.rsplit("_", 1)[1])
-    print(f"[DATASET] label={label}")
-    print(f"[DATASET] saved={destination.name}")
-    print(f"[DATASET] duration={duration_seconds:.2f}s")
+    technical(f"[DATASET] label={label}")
+    technical(f"[DATASET] saved={destination.name}")
+    technical(f"[DATASET] duration={duration_seconds:.2f}s")
     return {"label": label, "index": index, "filename": destination.name}
 
 
@@ -302,8 +330,8 @@ async def save_calibration_audio(
         "clipping": clipping,
         "wav_file": destination.name,
     })
-    print(f"[CAL] saved={destination.name}")
-    print(f"[CAL] pcm16_rms={pcm_metrics['rms']} peak_abs={pcm_metrics['peak_abs']}")
+    technical(f"[CAL] saved={destination.name}")
+    technical(f"[CAL] pcm16_rms={pcm_metrics['rms']} peak_abs={pcm_metrics['peak_abs']}")
     return {
         "filename": destination.name,
         "duration_ms": round(duration_seconds * 1000),

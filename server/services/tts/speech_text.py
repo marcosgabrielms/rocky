@@ -3,8 +3,9 @@
 import json
 import re
 
+from services.runtime_log import technical
 
-SPEECH_TEXT_DIAGNOSTICS = True
+
 MAX_LOG_CHARACTERS = 240
 
 
@@ -28,6 +29,5 @@ class SpeechTextSanitizer:
 
 
 def log_speech_text(source: str, stage: str, sequence: int, text: str) -> None:
-    if SPEECH_TEXT_DIAGNOSTICS:
-        preview = text[:MAX_LOG_CHARACTERS] + ("…" if len(text) > MAX_LOG_CHARACTERS else "")
-        print(f"[{source}] {stage} seq={sequence} text={json.dumps(preview, ensure_ascii=False)}")
+    preview = text[:MAX_LOG_CHARACTERS] + ("…" if len(text) > MAX_LOG_CHARACTERS else "")
+    technical(f"[{source}] {stage} seq={sequence} text={json.dumps(preview, ensure_ascii=False)}")

@@ -1,10 +1,12 @@
 """Guard de fala deterministico: nao carrega Piper nem chama LLM."""
 
 import io
+import os
 import sys
 import unittest
 from contextlib import redirect_stdout
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.modules.setdefault("piper", SimpleNamespace(PiperVoice=object))
 
@@ -85,7 +87,7 @@ class SpeechTextTest(unittest.TestCase):
 
     def test_debug_logs_are_bounded_and_escape_line_breaks(self) -> None:
         output = io.StringIO()
-        with redirect_stdout(output):
+        with patch.dict(os.environ, {"KODA_VERBOSE": "1"}), redirect_stdout(output):
             log_speech_text("LLM", "raw_sentence", 1, "\n" + "x" * 1000)
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertLess(len(output.getvalue()), 320)

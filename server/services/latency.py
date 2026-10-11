@@ -6,8 +6,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from itertools import count
 
+from services.runtime_log import info, technical
 
-LATENCY_DIAGNOSTICS = True
 _request_ids = count(1)
 
 
@@ -31,8 +31,14 @@ class LatencyTrace:
             self.report(name, self._events[end] - self._events[start], kind="duration")
 
     def report(self, name: str, value: object, kind: str = "info") -> None:
-        if LATENCY_DIAGNOSTICS:
-            print(f"[KODA LATENCY] clock=backend_request request={self.request_id} kind={kind} {name}={value}")
+        technical(f"[KODA LATENCY] clock=backend_request request={self.request_id} kind={kind} {name}={value}")
+
+    def summary(self) -> None:
+        """Mostra uma linha curta com as durações já medidas nesta interação."""
+        fields = (("STT", "stt_ms"), ("GPT", "llm_first_token_ms"), ("TTS", "tts_first_sentence_ms"))
+        parts = [f"{label} {self._events[name] / 1000:.1f}s" for label, name in fields if name in self._events]
+        if parts:
+            info("Latência: " + " | ".join(parts))
 
 
 _active_trace: ContextVar[LatencyTrace | None] = ContextVar("koda_latency", default=None)
@@ -64,3 +70,9 @@ def report_latency(name: str, value: object) -> None:
     trace = _active_trace.get()
     if trace is not None:
         trace.report(name, value)
+
+
+def report_latency_summary() -> None:
+    trace = _active_trace.get()
+    if trace is not None:
+        trace.summary()

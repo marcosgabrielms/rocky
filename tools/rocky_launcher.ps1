@@ -3,6 +3,8 @@
 $rockyDeviceId = "VID_1A86&PID_55D3"
 $serverPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\server"))
 $pythonPath = Join-Path $serverPath ".venv\Scripts\python.exe"
+$verboseValue = ([string]$env:KODA_VERBOSE).Trim().ToLowerInvariant()
+$verboseEnabled = @("1", "true", "yes", "on").Contains($verboseValue)
 
 try {
     $rockyDevice = Get-PnpDevice -PresentOnly |
@@ -51,7 +53,11 @@ try {
         exit 1
     }
     Write-Host "[KODA] Iniciando backend..."
-    & $pythonPath -m uvicorn app:app --host 0.0.0.0 --port 8000
+    $uvicornArguments = @("-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000")
+    if (-not $verboseEnabled) {
+        $uvicornArguments += "--no-access-log"
+    }
+    & $pythonPath @uvicornArguments
 }
 finally {
     Pop-Location

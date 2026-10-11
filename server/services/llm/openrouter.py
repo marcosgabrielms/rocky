@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 from services.llm.base import ConversationMessage, LLMError, LLMResult
 from services.llm.personality import ROCKY_SYSTEM_PROMPT
 from services.latency import mark_latency
+from services.runtime_log import error as log_error, technical
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -100,8 +101,8 @@ class OpenRouterLLMClient:
 
         elapsed_ms = round((time.monotonic() - started_at) * 1000)
         result = self._parse_response(response_body)
-        print("[LLM] response received")
-        print(f"[LLM] elapsed_ms={elapsed_ms}")
+        technical("[LLM] response received")
+        technical(f"[LLM] elapsed_ms={elapsed_ms}")
         if result.model:
             self._log_routed_model(result.model)
         return result
@@ -157,7 +158,8 @@ class OpenRouterLLMClient:
         if not self._api_key:
             raise LLMError("OPENROUTER_API_KEY is not configured")
         if not self._is_explicitly_free_model(self._model):
-            print("[LLM] model outside exact free allowlist blocked; no request sent")
+            log_error("Modelo OpenRouter não permitido.")
+            technical("[LLM] model outside exact free allowlist blocked; no request sent")
             raise LLMError("OpenRouter model is not explicitly free and locally approved")
 
     @staticmethod
@@ -199,11 +201,11 @@ class OpenRouterLLMClient:
         return preferences
 
     def _log_request(self, stream: bool) -> None:
-        print("[LLM] provider=openrouter")
-        print(f"[LLM] endpoint={OPENROUTER_URL}")
-        print(f"[LLM] model={self._model}")
-        print(f"[LLM] streaming={'true' if stream else 'false'}")
-        print("[LLM] sending request")
+        technical("[LLM] provider=openrouter")
+        technical(f"[LLM] endpoint={OPENROUTER_URL}")
+        technical(f"[LLM] model={self._model}")
+        technical(f"[LLM] streaming={'true' if stream else 'false'}")
+        technical("[LLM] sending request")
 
     @staticmethod
     def _build_messages(
@@ -262,20 +264,21 @@ class OpenRouterLLMClient:
     @staticmethod
     def _log_routed_model(model: str) -> None:
         # O campo remoto tambem pode conter texto arbitrario; nao ecoar valores desconhecidos.
-        print(f"[LLM] routed_model={model if model in SAFE_ROUTED_MODELS else '[unrecognized]'}")
+        technical(f"[LLM] routed_model={model if model in SAFE_ROUTED_MODELS else '[unrecognized]'}")
 
     @classmethod
     def _log_http_error(cls, error: HTTPError) -> None:
-        print(f"[LLM] http_status={error.code}")
+        log_error("Falha na requisição OpenRouter.")
+        technical(f"[LLM] http_status={error.code}")
         try:
             with error:
                 body = error.read(MAX_ERROR_BODY_BYTES + 1)
             if len(body) > MAX_ERROR_BODY_BYTES:
-                print("[LLM] error_body=too_large; details omitted")
+                technical("[LLM] error_body=too_large; details omitted")
                 return
             cls._log_error_details(json.loads(body))
         except (OSError, HTTPException, ValueError, TypeError, RecursionError):
-            print("[LLM] error_body=unavailable_or_invalid; details omitted")
+            technical("[LLM] error_body=unavailable_or_invalid; details omitted")
 
     @classmethod
     def _log_error_details(cls, payload: Any) -> None:
@@ -284,10 +287,10 @@ class OpenRouterLLMClient:
             return
         code = cls._safe_error_code(error.get("code"))
         if code is not None:
-            print(f"[LLM] error_code={code}")
+            technical(f"[LLM] error_code={code}")
         message = error.get("message")
         if isinstance(message, str) and message:
-            print(f"[LLM] error_message={json.dumps(cls._safe_error_message(message))}")
+            technical(f"[LLM] error_message={json.dumps(cls._safe_error_message(message))}")
         metadata = error.get("metadata")
         if isinstance(metadata, dict):
             cls._log_safe_metadata(metadata)
@@ -327,10 +330,10 @@ class OpenRouterLLMClient:
         for field in ("error_type", "provider_code"):
             value = cls._safe_error_code(metadata.get(field))
             if value is not None:
-                print(f"[LLM] metadata.{field}={value}")
+                technical(f"[LLM] metadata.{field}={value}")
         provider = metadata.get("provider_name")
         if isinstance(provider, str) and provider in SAFE_PROVIDER_NAMES:
-            print(f"[LLM] metadata.provider_name={provider}")
+            technical(f"[LLM] metadata.provider_name={provider}")
         model = metadata.get("model")
         if isinstance(model, str) and model in SAFE_ROUTED_MODELS:
-            print(f"[LLM] metadata.model={model}")
+            technical(f"[LLM] metadata.model={model}")

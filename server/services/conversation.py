@@ -11,6 +11,7 @@ from models.actions import BackendResponse, expression, idle_response, show_text
 from services.commands import detect_command_intent, get_current_time, normalize_text
 from services.llm import ConversationMessage, LLMClient, LLMError, SentenceBuffer, StreamingLLMClient
 from services.latency import latency_metric, mark_latency
+from services.runtime_log import error as log_error, info, technical
 
 
 WAKE_PREFIX = re.compile(r"^\W*(?P<wake>\w+)(?=$|\W)(?P<command>.*)$", re.DOTALL)
@@ -150,7 +151,7 @@ class ConversationManager:
         buffer = SentenceBuffer(preserve_line_breaks=True)
         sentences: list[str] = []
         received_text = False
-        print("[RT] llm_request_start")
+        technical("[RT] llm_request_start")
         mark_latency("llm_request_start")
         try:
             for chunk in self._llm_client.stream_response(decision.text, context=decision.context):
@@ -161,12 +162,12 @@ class ConversationManager:
                     first_token_at = now
                     mark_latency("llm_first_token")
                     latency_metric("llm_first_token_ms", "llm_request_start", "llm_first_token")
-                    print(f"[RT] llm_first_token_ms={round((now - started_at) * 1000)}")
+                    technical(f"[RT] llm_first_token_ms={round((now - started_at) * 1000)}")
                 received_text = True
                 new_sentences = buffer.push(chunk)
                 if new_sentences and first_sentence_at is None:
                     first_sentence_at = now
-                    print(f"[RT] first_sentence_ms={round((now - started_at) * 1000)}")
+                    technical(f"[RT] first_sentence_ms={round((now - started_at) * 1000)}")
                 self._append_sentences(sentences, new_sentences, started_at, on_sentence)
         except LLMError as error:
             if not received_text:
@@ -191,7 +192,7 @@ class ConversationManager:
         residual = buffer.finish()
         if residual:
             if first_sentence_at is None:
-                print(f"[RT] first_sentence_ms={round((time.monotonic() - started_at) * 1000)}")
+                technical(f"[RT] first_sentence_ms={round((time.monotonic() - started_at) * 1000)}")
             self._append_sentences(sentences, (residual,), started_at, on_sentence)
 
         complete_text = " ".join(sentences).strip()
@@ -219,7 +220,7 @@ class ConversationManager:
         if interaction_mode != InteractionMode.COMMAND:
             command = extract_wake_command(text)
             if command:
-                print("[CONVERSATION] wake matched with command")
+                technical("[CONVERSATION] wake matched with command")
                 text = command
                 interaction_mode = InteractionMode.COMMAND
         direct_response, context = self._prepare_response(
@@ -228,7 +229,7 @@ class ConversationManager:
         mark_latency("classify_done")
         latency_metric("classify_ms", "classify_start", "classify_done")
         if direct_response is None:
-            print("[CONV] classify kind=llm")
+            technical("[CONV] classify kind=llm")
             return InteractionDecision(InteractionKind.LLM, text, device_id, context=context)
         if direct_response.get("interaction_state") == "attention":
             kind = InteractionKind.WAKE if direct_response.get("actions") else InteractionKind.EMPTY
@@ -238,7 +239,7 @@ class ConversationManager:
             kind = InteractionKind.DETERMINISTIC
         else:
             kind = InteractionKind.EMPTY
-        print(f"[CONV] classify kind={kind}")
+        technical(f"[CONV] classify kind={kind}")
         return InteractionDecision(kind, text, device_id, direct_response=direct_response)
 
     def _prepare_response(
@@ -254,9 +255,10 @@ class ConversationManager:
             self._waiting_commands.discard(device_id)
         if interaction_mode != InteractionMode.COMMAND and is_wake_phrase(text):
             self._waiting_commands.add(device_id)
-            print("[CONVERSATION] wake matched")
-            print("[CONVERSATION] state=waiting_command")
-            print("[CONVERSATION] attention owner=firmware")
+            info("Wake: Koda")
+            technical("[CONVERSATION] wake matched")
+            technical("[CONVERSATION] state=waiting_command")
+            technical("[CONVERSATION] attention owner=firmware")
             return (
                 {
                     "text": text,
@@ -272,29 +274,30 @@ class ConversationManager:
         if not is_command:
             return {"text": text, "interaction_state": "idle", "actions": []}, ()
 
-        print("[CONVERSATION] state=waiting_command")
-        print(f"[CONVERSATION] command source={'firmware' if interaction_mode is not None else 'legacy'}")
-        print(f'[COMMAND] normalized="{normalized}"')
+        technical("[CONVERSATION] state=waiting_command")
+        technical(f"[CONVERSATION] command source={'firmware' if interaction_mode is not None else 'legacy'}")
+        technical(f'[COMMAND] normalized="{normalized}"')
         if not normalized:
-            print("[CONVERSATION] non-speech transcription -> attention")
+            technical("[CONVERSATION] non-speech transcription -> attention")
             return self._attention_response(text), ()
 
         if low_confidence:
-            print("[CONVERSATION] low-confidence transcription -> attention")
+            technical("[CONVERSATION] low-confidence transcription -> attention")
             return self._attention_response(text), ()
 
         if normalized in COMMAND_FILLERS or NON_LEXICAL_VOCALIZATION.fullmatch(normalized):
-            print("[CONVERSATION] non-lexical transcription -> attention")
+            technical("[CONVERSATION] non-lexical transcription -> attention")
             return self._attention_response(text), ()
 
         self._waiting_commands.discard(device_id)
 
         if detect_command_intent(normalized) == "hours":
             current_time = get_current_time()
-            print("[ROUTER] intent=hours")
-            print("[INTENT] matched=hours")
-            print(f"[TIME] current={current_time}")
-            print("[CONVERSATION] completed -> idle")
+            info("Intenção: hours")
+            technical("[ROUTER] intent=hours")
+            technical("[INTENT] matched=hours")
+            technical(f"[TIME] current={current_time}")
+            technical("[CONVERSATION] completed -> idle")
             return (
                 {
                     "text": text,
@@ -304,9 +307,9 @@ class ConversationManager:
                 (),
             )
 
-        print("[INTENT] unknown")
-        print("[ROUTER] fallback=llm")
-        print("[CONVERSATION] completed -> idle")
+        technical("[INTENT] unknown")
+        technical("[ROUTER] fallback=llm")
+        technical("[CONVERSATION] completed -> idle")
         return None, context
 
     @staticmethod
@@ -335,12 +338,13 @@ class ConversationManager:
 
     @staticmethod
     def _print_stream_metrics(started_at: float, sentence_count: int) -> None:
-        print(f"[RT] llm_complete_ms={round((time.monotonic() - started_at) * 1000)}")
-        print(f"[RT] sentences={sentence_count}")
+        technical(f"[RT] llm_complete_ms={round((time.monotonic() - started_at) * 1000)}")
+        technical(f"[RT] sentences={sentence_count}")
 
     def _unavailable_llm_response(self, error: LLMError) -> BackendResponse:
-        print(f"[LLM] provider unavailable error={error}")
-        print("[LLM] provider fallback disabled")
+        log_error("Falha ao acessar o modelo de linguagem.")
+        technical(f"[LLM] provider unavailable error={type(error).__name__}")
+        technical("[LLM] provider fallback disabled")
         return self._idle_llm_response(LLM_UNAVAILABLE_MESSAGE)
 
     def _get_context(self, device_id: str, now: float) -> tuple[ConversationMessage, ...]:

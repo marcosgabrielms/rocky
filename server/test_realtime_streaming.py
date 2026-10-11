@@ -35,6 +35,13 @@ class FakeResponse:
 
 
 class OpenRouterStreamingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._verbose = patch.dict(os.environ, {"KODA_VERBOSE": "1"})
+        self._verbose.start()
+
+    def tearDown(self) -> None:
+        self._verbose.stop()
+
     def test_total_deadline_covers_keepalives_without_retry(self) -> None:
         from types import SimpleNamespace
         clock = SimpleNamespace(now=0.0)
@@ -146,7 +153,7 @@ class OpenRouterStreamingTest(unittest.TestCase):
             "model": "inclusionai/ling-3.1-flash",
             "choices": [{"message": {"content": "Resposta final.", "reasoning": "NEVER SPEAK"}}],
         }).encode()
-        with patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()) as logs:
+        with patch.dict(os.environ, {"KODA_VERBOSE": "1"}, clear=True), redirect_stdout(io.StringIO()) as logs:
             with patch("services.llm.openrouter.urlopen", return_value=FakeResponse(body)) as request:
                 result = OpenRouterLLMClient(api_key="test-key").ask("Pergunta")
         request.assert_called_once()
@@ -229,6 +236,7 @@ class OpenRouterStreamingTest(unittest.TestCase):
         output = io.StringIO()
         with (
             patch("services.llm.openrouter.urlopen", return_value=FakeResponse(lines=(event, event, b"data: [DONE]\n"))) as request,
+            patch.dict(os.environ, {"KODA_VERBOSE": "1"}),
             redirect_stdout(output),
         ):
             tuple(OpenRouterLLMClient(api_key="test-key", model=DEFAULT_MODEL).stream_response("Pergunta"))
@@ -333,6 +341,7 @@ class OpenRouterStreamingTest(unittest.TestCase):
         output = io.StringIO()
         with (
             patch("services.llm.openrouter.urlopen", return_value=FakeResponse(lines=(event, event, b"data: [DONE]\n"))) as request,
+            patch.dict(os.environ, {"KODA_VERBOSE": "1"}),
             redirect_stdout(output),
             latency_scope(),
         ):
@@ -411,7 +420,8 @@ class OpenRouterStreamingTest(unittest.TestCase):
                 }}).encode()
                 error = HTTPError("https://example.test", 429, private_text, None, io.BytesIO(body))
                 logs = io.StringIO()
-                with patch("services.llm.openrouter.urlopen", side_effect=error) as request, redirect_stdout(logs):
+                with (patch("services.llm.openrouter.urlopen", side_effect=error) as request,
+                      patch.dict(os.environ, {"KODA_VERBOSE": "1"}), redirect_stdout(logs)):
                     client = OpenRouterLLMClient(api_key=sensitive_values[0])
                     context = (ConversationMessage(role="user", content=sensitive_values[2]),)
                     with self.assertRaisesRegex(LLMError, "HTTP 429"):
@@ -478,10 +488,16 @@ class OpenRouterStreamingTest(unittest.TestCase):
                       redirect_stdout(logs)):
                     self.assertEqual(OpenRouterLLMClient(api_key="test-key").ask("Pergunta").text, "Resposta.")
                 request.assert_called_once()
-                if model is None:
-                    self.assertNotIn("routed_model=", logs.getvalue())
-                else:
-                    self.assertIn(f"routed_model={model}", logs.getvalue())
+                self.assertNotIn("routed_model=", logs.getvalue())
+
+            if model is not None:
+                verbose_logs = io.StringIO()
+                with (patch.dict(os.environ, {"KODA_VERBOSE": "1"}, clear=True),
+                      patch("services.llm.openrouter.urlopen", return_value=FakeResponse(json.dumps(payload).encode())) as request,
+                      redirect_stdout(verbose_logs)):
+                    self.assertEqual(OpenRouterLLMClient(api_key="test-key").ask("Pergunta").text, "Resposta.")
+                request.assert_called_once()
+                self.assertIn(f"routed_model={model}", verbose_logs.getvalue())
 
     def test_sse_error_diagnostics_remain_safe_and_controlled(self) -> None:
         logs = io.StringIO()

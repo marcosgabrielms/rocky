@@ -8,6 +8,7 @@ from openai import OpenAI
 from services.auth import AuthError, ChatGPTSession
 from services.llm.base import ConversationMessage, LLMError, LLMResult
 from services.llm.personality import ROCKY_SYSTEM_PROMPT
+from services.runtime_log import error as log_error, info, technical
 
 
 DEFAULT_MODEL = "gpt-5.6-terra"
@@ -76,7 +77,10 @@ class ChatGPTPlanLLMClient:
         try:
             return self._session.access_token_for_inference()
         except AuthError as error:
-            print(f"[LLM] provider=chatgpt_plan auth_error={self._safe_error_code(str(error), 'authentication_required')}")
+            log_error("Autenticação ChatGPT necessária.")
+            technical(
+                f"[LLM] provider=chatgpt_plan auth_error={self._safe_error_code(str(error), 'authentication_required')}"
+            )
             raise LLMError("ChatGPT Plan authentication is required") from None
 
     def _request_arguments(
@@ -93,21 +97,24 @@ class ChatGPTPlanLLMClient:
         }
 
     def _log_request(self) -> None:
-        print("[LLM] provider=chatgpt_plan")
-        print(f"[LLM] model={self._model}")
-        print("[LLM] streaming=true")
-        print("[LLM] sending request")
+        info(f"GPT: {self._model}")
+        technical("[LLM] provider=chatgpt_plan")
+        technical(f"[LLM] model={self._model}")
+        technical("[LLM] streaming=true")
+        technical("[LLM] sending request")
 
     def _raise_event_error(self, event: object, fallback: str) -> None:
         response = self._event_value(event, "response")
         error = self._event_value(response, "error")
         code = self._safe_error_code(self._event_value(error, "code"), fallback)
-        print(f"[LLM] provider=chatgpt_plan error_code={code}")
+        log_error("Falha na resposta do ChatGPT.")
+        technical(f"[LLM] provider=chatgpt_plan error_code={code}")
         raise LLMError(f"ChatGPT Plan response failed: {code}")
 
     def _raise_sdk_error(self, error: Exception) -> None:
         code = self._safe_error_code(getattr(error, "code", None), "request_failed")
-        print(f"[LLM] provider=chatgpt_plan error_code={code}")
+        log_error("Falha na requisição ao ChatGPT.")
+        technical(f"[LLM] provider=chatgpt_plan error_code={code}")
         raise LLMError("ChatGPT Plan request failed") from None
 
     def _log_usage(self, response: object) -> None:

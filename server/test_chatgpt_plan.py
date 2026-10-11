@@ -54,6 +54,13 @@ class SessionDouble:
 
 
 class ChatGPTPlanLLMClientTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._verbose = patch.dict(os.environ, {"KODA_VERBOSE": "1"})
+        self._verbose.start()
+
+    def tearDown(self) -> None:
+        self._verbose.stop()
+
     @staticmethod
     def completed_events():
         return (

@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from faster_whisper import WhisperModel
 
 from services.latency import latency_metric, mark_latency
+from services.runtime_log import technical
 
 
 SAMPLE_RATE = 16000
@@ -50,15 +51,15 @@ def report_transcription_diagnostics(
     if not STT_DIAGNOSTICS:
         return
 
-    print(f"[STT DIAG] duration={duration:.2f}")
-    print(f"[STT DIAG] duration_after_vad={duration_after_vad:.2f}")
-    print(f"[STT DIAG] segments={len(segments)}")
+    technical(f"[STT DIAG] duration={duration:.2f}")
+    technical(f"[STT DIAG] duration_after_vad={duration_after_vad:.2f}")
+    technical(f"[STT DIAG] segments={len(segments)}")
     for index, segment in enumerate(segments):
-        print(f'[STT DIAG] segment={index} text="{segment.text}"')
-        print(f"[STT DIAG] segment={index} no_speech_prob={segment.no_speech_prob:.4f}")
-        print(f"[STT DIAG] segment={index} avg_logprob={segment.avg_logprob:.4f}")
-        print(f"[STT DIAG] segment={index} compression_ratio={segment.compression_ratio:.4f}")
-    print(f"[STT DIAG] decision={'accepted' if accepted else 'rejected'}")
+        technical(f'[STT DIAG] segment={index} text="{segment.text}"')
+        technical(f"[STT DIAG] segment={index} no_speech_prob={segment.no_speech_prob:.4f}")
+        technical(f"[STT DIAG] segment={index} avg_logprob={segment.avg_logprob:.4f}")
+        technical(f"[STT DIAG] segment={index} compression_ratio={segment.compression_ratio:.4f}")
+    technical(f"[STT DIAG] decision={'accepted' if accepted else 'rejected'}")
 
 
 def assess_transcription(

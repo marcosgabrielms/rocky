@@ -5,6 +5,8 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from threading import Lock
+
+from services.runtime_log import technical
 from collections.abc import Callable
 
 from services.tts.realtime import RealtimeAudioSegment
@@ -79,7 +81,7 @@ class RealtimeAudioQueue:
                 production_status=AudioProductionStatus.ACTIVE,
                 updated_at=self._clock(),
             )
-        print(f"[RTQ] create interaction={interaction_id}")
+        technical(f"[RTQ] create interaction={interaction_id}")
         return interaction_id
 
     def has_interaction(self, interaction_id: int) -> bool:
@@ -111,7 +113,7 @@ class RealtimeAudioQueue:
             interaction.items[item.sequence] = item
             interaction.next_sequence += 1
             interaction.updated_at = self._clock()
-        print(f"[RTQ] enqueue interaction={interaction_id} seq={item.sequence}")
+        technical(f"[RTQ] enqueue interaction={interaction_id} seq={item.sequence}")
         return item
 
     def next_item(self, interaction_id: int) -> QueuedAudioSegment | None:
@@ -120,7 +122,7 @@ class RealtimeAudioQueue:
             item = interaction.items.get(interaction.next_to_consume)
             if item is None or item.status is not AudioItemStatus.READY:
                 return None
-        print(f"[RTQ] dequeue interaction={interaction_id} seq={item.sequence}")
+        technical(f"[RTQ] dequeue interaction={interaction_id} seq={item.sequence}")
         return item
 
     def mark_consumed(self, interaction_id: int, sequence: int) -> QueuedAudioSegment:
@@ -137,7 +139,7 @@ class RealtimeAudioQueue:
             interaction.next_to_consume += 1
             interaction.updated_at = self._clock()
             self._remove_audio_file(consumed.audio_path)
-        print(f"[RTQ] consumed interaction={interaction_id} seq={sequence}")
+        technical(f"[RTQ] consumed interaction={interaction_id} seq={sequence}")
         return consumed
 
     def mark_production_done(self, interaction_id: int) -> None:
@@ -163,7 +165,7 @@ class RealtimeAudioQueue:
                     cancelled = replace(item, status=AudioItemStatus.CANCELLED)
                     interaction.items[sequence] = cancelled
                     self._remove_audio_file(cancelled.audio_path)
-        print(f"[RTQ] cancelled interaction={interaction_id}")
+        technical(f"[RTQ] cancelled interaction={interaction_id}")
 
     def state(self, interaction_id: int) -> AudioInteractionState:
         with self._lock:
@@ -197,7 +199,7 @@ class RealtimeAudioQueue:
             ):
                 return False
             self._interactions.pop(interaction_id)
-        print(f"[RTQ] cleanup interaction={interaction_id}")
+        technical(f"[RTQ] cleanup interaction={interaction_id}")
         return True
 
     def cleanup_expired(self, maximum_age_seconds: float) -> tuple[int, ...]:
@@ -216,7 +218,7 @@ class RealtimeAudioQueue:
                 self._interactions.pop(interaction_id)
                 removed_ids.append(interaction_id)
         for interaction_id in removed_ids:
-            print(f"[RTQ] cleanup_expired interaction={interaction_id}")
+            technical(f"[RTQ] cleanup_expired interaction={interaction_id}")
         return tuple(removed_ids)
 
     def _mark_production(
@@ -231,7 +233,7 @@ class RealtimeAudioQueue:
             interaction.production_status = status
             interaction.updated_at = self._clock()
         log_status = "production_done" if status is AudioProductionStatus.COMPLETED else "production_failed"
-        print(f"[RTQ] {log_status} interaction={interaction_id}")
+        technical(f"[RTQ] {log_status} interaction={interaction_id}")
 
     def _get_active_interaction(self, interaction_id: int) -> _Interaction:
         interaction = self._get_interaction(interaction_id)

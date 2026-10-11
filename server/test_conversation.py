@@ -1,7 +1,8 @@
 """Testes determinísticos para wake word e contexto curto do Rocky."""
 
-import unittest
 import io
+import os
+import unittest
 from collections.abc import Sequence
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -420,6 +421,9 @@ class ConversationTest(unittest.TestCase):
 
 class FirmwareAttentionTest(unittest.TestCase):
     def setUp(self) -> None:
+        verbose_patch = patch.dict(os.environ, {"KODA_VERBOSE": "1"})
+        verbose_patch.start()
+        self.addCleanup(verbose_patch.stop)
         self.clock = FakeClock()
         monotonic_patch = patch("services.conversation.time.monotonic", side_effect=self.clock)
         self.monotonic = monotonic_patch.start()

@@ -88,6 +88,7 @@ class RealtimeAudioTest(unittest.TestCase):
                                        RealtimeTTS(tts, self.output_directory))
         logs = io.StringIO()
         with (patch("services.llm.openrouter.urlopen", return_value=FakeResponse(lines=lines)) as request,
+              patch.dict(os.environ, {"KODA_VERBOSE": "1"}),
               redirect_stdout(logs)):
             result = service.build_stream_audio_response("Koda, quem criou o Linux?", "default-ling")
         request.assert_called_once()
@@ -149,8 +150,11 @@ class RealtimeAudioTest(unittest.TestCase):
         self._temporary_directory = TemporaryDirectory()
         self.output_directory = Path(self._temporary_directory.name) / "realtime"
         self.clock = FakeClock()
+        self._verbose = patch.dict(os.environ, {"KODA_VERBOSE": "1"})
+        self._verbose.start()
 
     def tearDown(self) -> None:
+        self._verbose.stop()
         self._temporary_directory.cleanup()
 
     def build_service(

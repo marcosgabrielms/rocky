@@ -11,6 +11,7 @@ from threading import Lock
 from models.actions import BackendResponse
 from services.tts.base import TTSClient
 from services.latency import latency_metric, mark_latency
+from services.runtime_log import error as log_error, technical
 from services.tts.speech_text import SpeechTextSanitizer, log_speech_text
 
 
@@ -83,17 +84,18 @@ class LocalResponseSpeaker:
                 resample_wav(self._output_path, SUPPORTED_SAMPLE_RATE)
                 mark_latency("tts_ready")
                 latency_metric("tts_first_sentence_ms", "tts_start", "tts_ready")
-                print(f"[TTS] generated path={self._output_path.name} rate={SUPPORTED_SAMPLE_RATE}")
+                technical(f"[TTS] generated path={self._output_path.name} rate={SUPPORTED_SAMPLE_RATE}")
                 report_pcm_metrics(analyze_pcm_wav(self._output_path))
 
                 if self._enable_local_playback:
                     import winsound
                     winsound.PlaySound(str(self._output_path), winsound.SND_FILENAME)
         except Exception as error:
-            print(f"[TTS] error={error}")
+            log_error("Falha ao sintetizar resposta.")
+            technical(f"[TTS] error={type(error).__name__}")
             return False
 
-        print(f'[AUDIO] ready path={self._output_path.name}')
+        technical(f'[AUDIO] ready path={self._output_path.name}')
         mark_latency("audio_available")
         latency_metric("audio_ready_ms", "stt_start", "audio_available")
         return True
@@ -183,14 +185,14 @@ def analyze_pcm_wav(wav_path: Path) -> PcmMetrics:
 
 
 def report_pcm_metrics(metrics: PcmMetrics) -> None:
-    print(
+    technical(
         "[TTS PCM] "
         f"min={metrics.minimum} max={metrics.maximum} peak={metrics.peak_absolute} "
         f"mean={metrics.mean:.1f} rms={metrics.rms:.1f} "
         f"clipping={metrics.negative_clipping + metrics.positive_clipping} "
         f"({metrics.clipping_percent:.4f}%)"
     )
-    print(
+    technical(
         "[TTS PCM] "
         f"above90={metrics.percentage(metrics.above_90_percent):.4f}% "
         f"above95={metrics.percentage(metrics.above_95_percent):.4f}% "

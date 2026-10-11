@@ -164,8 +164,13 @@ O instante real de stt_done fica nos logs do backend; não foi falsamente
 deduzido da resposta HTTP. O timestamp do primeiro áudio é emitido no enqueue
 do primeiro WAV, não ao final da geração inteira.
 
-`services/latency.py: LATENCY_DIAGNOSTICS` permite silenciar os novos logs do
-backend. Não há log por amostra ou por frame no firmware.
+`KODA_VERBOSE` controla os diagnósticos do backend. Valores `1`, `true`,
+`yes` e `on` (sem distinção entre maiúsculas/minúsculas) mostram os logs
+`[KODA LATENCY]`, `[RTD]`, `[RTQ]`, `[RT]` e os detalhes internos de STT, LLM
+e TTS. Ausente, vazio, `0`, `false`, `no` ou `off` mantém o modo normal com
+uma linha curta por interação. O launcher também usa esse valor para ativar
+os access logs do Uvicorn; erros e `[USAGE]` continuam visíveis nos dois
+modos. Não há log por amostra ou por frame no firmware.
 
 ### Teste físico comparativo
 
@@ -233,8 +238,9 @@ explicacoes comuns; mais detalhes somente quando pedidos. O provider padrao e o
 ChatGPT Plan autenticado localmente, com `gpt-5.6-terra`, `instructions` para a
 personalidade e contexto local enviado em `input`. Cada request usa Responses
 com `store=false`, `stream=true`, `max_retries=0` e sem fallback automatico.
-Logs temporarios de texto usam `SPEECH_TEXT_DIAGNOSTICS` e previews limitados
-a 240 caracteres; nao incluem chave, tokens de autenticacao ou dados PCM.
+Os previews técnicos de texto são exibidos somente com `KODA_VERBOSE` e são
+limitados a 240 caracteres; não incluem chave, tokens de autenticação ou
+dados PCM.
 
 Testes deterministas adicionais:
 

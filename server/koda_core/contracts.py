@@ -34,6 +34,14 @@ class UsageRecord:
 
 
 @dataclass(frozen=True)
+class CoreContextMessage:
+    """Mensagem histórica mínima necessária para continuar uma decisão de LLM."""
+
+    role: str
+    content: str
+
+
+@dataclass(frozen=True)
 class InteractionResult:
     """Resultado de uma interação, sem acoplamento ao transporte físico."""
 
@@ -44,6 +52,17 @@ class InteractionResult:
     model: str | None = None
     usage: UsageRecord | None = None
     metadata: Metadata = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CoreDecision:
+    """Decisão pura que separa resposta direta de continuação por LLM."""
+
+    kind: str
+    text: str
+    device_id: str
+    direct_result: InteractionResult | None = None
+    context: tuple[CoreContextMessage, ...] = ()
 
 
 @dataclass(frozen=True)

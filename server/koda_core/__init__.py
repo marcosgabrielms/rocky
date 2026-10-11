@@ -9,9 +9,11 @@ from .contracts import (
     UsageRecord,
 )
 from .core import ConversationProcessor, KodaCore
+from .conversation_adapter import ConversationCoreAdapter
 
 __all__ = [
     "ConversationProcessor",
+    "ConversationCoreAdapter",
     "CoreContextMessage",
     "CoreDecision",
     "DeviceContext",

@@ -34,6 +34,7 @@ class _ConversationDouble:
         self.execute_calls = 0
         self.received_at: float | None = None
         self.classify_arguments: tuple[str, str, InteractionMode | None, bool] | None = None
+        self.built_decision: InteractionDecision | None = None
 
     def capture_request_time(self) -> float:
         return 0.0
@@ -50,6 +51,7 @@ class _ConversationDouble:
 
     def build_response_from_decision(self, decision: InteractionDecision) -> dict[str, object]:
         self.execute_calls += 1
+        self.built_decision = decision
         assert decision == self.decision
         return dict(self.response)
 
@@ -279,6 +281,87 @@ class RealtimeEndpointTest(TestCase):
         adapter.build_direct_result.assert_called_once()
         adapter.to_conversation_decision.assert_not_called()
         self.assertEqual(conversation.classify_calls, 1)
+
+    def test_transcribe_creates_core_request_and_uses_direct_result(self) -> None:
+        direct = {
+            "text": "Volume ajustado para 50%.",
+            "interaction_state": "idle",
+            "actions": [{"type": "set_volume", "percent": 50}],
+        }
+        decision = InteractionDecision(InteractionKind.DETERMINISTIC, "volume em 50%", "koda-core", direct)
+        conversation = _ConversationDouble(decision, direct)
+        adapter = Mock(wraps=self.core_adapter(conversation))
+        transcription = TranscriptionResult("volume em 50%", has_speech=True, low_confidence=True)
+
+        with (
+            patch.object(app, "conversation_manager", conversation),
+            patch.object(app, "conversation_core_adapter", adapter),
+            patch.object(app, "transcribe_audio", return_value=transcription),
+            patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+            patch.object(app, "validate_wav", return_value=1.0),
+            patch.object(app.response_speaker, "speak_response", return_value=True),
+        ):
+            response = TestClient(app.app).post(
+                "/transcribe",
+                headers={
+                    "X-Rocky-Device": "koda-core",
+                    "X-Rocky-Interaction-Mode": "command",
+                },
+                files={"file": ("speech.wav", b"wav", "audio/wav")},
+            )
+
+        request = adapter.classify.call_args.args[0]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(request.user_id, "local-user")
+        self.assertEqual(request.device_id, "koda-core")
+        self.assertEqual(request.input_type, "voice_transcript")
+        self.assertEqual(request.text, "volume em 50%")
+        self.assertEqual(conversation.classify_arguments,
+                         ("volume em 50%", "koda-core", InteractionMode.COMMAND, True))
+        self.assertEqual(conversation.received_at, 0.0)
+        self.assertEqual(response.json()["actions"], [{"type": "set_volume", "percent": 50}])
+        self.assertTrue(response.json()["audio_available"])
+        adapter.classify.assert_called_once()
+        adapter.build_direct_result.assert_called_once()
+        adapter.to_conversation_decision.assert_not_called()
+        self.assertEqual(conversation.classify_calls, 1)
+
+    def test_transcribe_continues_llm_with_rebuilt_decision_without_reclassification(self) -> None:
+        context = (ConversationMessage(role="user", content="Quem criou o Linux?"),)
+        decision = InteractionDecision(InteractionKind.LLM, "E de onde ele e?", "koda-core", context=context)
+        response_data = {"text": "Ele nasceu na Finlandia.", "interaction_state": "idle", "actions": []}
+        conversation = _ConversationDouble(decision, response_data)
+        adapter = Mock(wraps=self.core_adapter(conversation))
+
+        with (
+            patch.object(app, "conversation_manager", conversation),
+            patch.object(app, "conversation_core_adapter", adapter),
+            patch.object(app, "transcribe_audio", return_value=decision.text),
+            patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+            patch.object(app, "validate_wav", return_value=1.0),
+            patch.object(app.response_speaker, "speak_response", return_value=False),
+        ):
+            response = TestClient(app.app).post(
+                "/transcribe",
+                headers={"X-Rocky-Device": "koda-core"},
+                files={"file": ("speech.wav", b"wav", "audio/wav")},
+            )
+
+        request = adapter.classify.call_args.args[0]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(request.device_id, "koda-core")
+        self.assertEqual(request.text, decision.text)
+        self.assertEqual(conversation.classify_arguments,
+                         (decision.text, "koda-core", None, False))
+        self.assertEqual(conversation.built_decision, decision)
+        self.assertEqual(conversation.built_decision.context, context)
+        self.assertEqual(response.json()["text"], "Ele nasceu na Finlandia.")
+        self.assertFalse(response.json()["audio_available"])
+        adapter.classify.assert_called_once()
+        adapter.build_direct_result.assert_not_called()
+        adapter.to_conversation_decision.assert_called_once()
+        self.assertEqual(conversation.classify_calls, 1)
+        self.assertEqual(conversation.execute_calls, 1)
 
     def test_realtime_continues_llm_with_rebuilt_decision_without_reclassification(self) -> None:
         context = (ConversationMessage(role="user", content="Quem criou o Linux?"),)

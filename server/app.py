@@ -125,10 +125,24 @@ async def _transcribe(
     mark_latency("stt_done")
     latency_metric("stt_ms", "stt_start", "stt_done")
     technical("[STT] transcription completed")
-    response = conversation_manager.build_response(
-        text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode,
+    request = InteractionRequest(
+        user_id=LOCAL_USER_ID,
+        device_id=x_rocky_device,
+        input_type="voice_transcript",
+        text=text,
+    )
+    core_decision = conversation_core_adapter.classify(
+        request,
+        received_at=received_at,
+        interaction_mode=interaction_mode,
         low_confidence=low_confidence,
     )
+    if core_decision.direct_result is not None:
+        result = conversation_core_adapter.build_direct_result(core_decision)
+        response = _interaction_result_to_http_response(result)
+    else:
+        decision = conversation_core_adapter.to_conversation_decision(core_decision)
+        response = conversation_manager.build_response_from_decision(decision)
     _report_transcription_and_response(text, low_confidence, response)
     response["audio_available"] = response_speaker.speak_response(response, text)
     report_latency_summary()

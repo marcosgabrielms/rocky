@@ -15,11 +15,16 @@ class ShowTextAction(TypedDict):
     duration_ms: int
 
 
+class SetVolumeAction(TypedDict):
+    type: str
+    percent: int
+
+
 class BackendResponse(TypedDict, total=False):
     text: str
     interaction_state: str
     command_window_ms: int
-    actions: list[ExpressionAction | ShowTextAction]
+    actions: list[ExpressionAction | ShowTextAction | SetVolumeAction]
     audio_available: bool
 
 
@@ -34,6 +39,10 @@ def show_text(line1: str, line2: str, duration_ms: int) -> ShowTextAction:
         "line2": line2,
         "duration_ms": duration_ms,
     }
+
+
+def set_volume(percent: int) -> SetVolumeAction:
+    return {"type": "set_volume", "percent": percent}
 
 
 def idle_response(text: str) -> BackendResponse:

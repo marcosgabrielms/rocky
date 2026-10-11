@@ -692,6 +692,13 @@ void handleBackendResponse(const SttClient::BackendResponse& response, bool defe
         else
             Serial.println("[ACTION] unsupported=show_text");
     }
+    else if (response.action.type == SttClient::BackendAction::Type::SetVolume)
+    {
+        if (speaker.setVolumePercent(response.action.volumePercent))
+            Serial.printf("[ACTION] volume=%u%%\n", speaker.getVolumePercent());
+        else
+            Serial.println("[ACTION] volume persistence failed");
+    }
     else if (!response.action.value.isEmpty())
         Serial.printf("[ACTION] unsupported=%s\n", response.action.value.c_str());
 

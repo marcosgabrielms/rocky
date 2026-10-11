@@ -7,8 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from models.actions import BackendResponse, expression, idle_response, show_text
-from services.commands import detect_command_intent, get_current_time, normalize_text
+from models.actions import BackendResponse, expression, idle_response, set_volume, show_text
+from services.commands import detect_command_intent, extract_volume_percent, get_current_time, normalize_text
 from services.llm import ConversationMessage, LLMClient, LLMError, SentenceBuffer, StreamingLLMClient
 from services.latency import latency_metric, mark_latency
 from services.runtime_log import error as log_error, info, technical
@@ -235,7 +235,7 @@ class ConversationManager:
             kind = InteractionKind.WAKE if direct_response.get("actions") else InteractionKind.EMPTY
         elif not normalize_text(text):
             kind = InteractionKind.EMPTY
-        elif any(action.get("type") == "show_text" for action in direct_response.get("actions", [])):
+        elif any(action.get("type") in {"show_text", "set_volume"} for action in direct_response.get("actions", [])):
             kind = InteractionKind.DETERMINISTIC
         else:
             kind = InteractionKind.EMPTY
@@ -291,7 +291,8 @@ class ConversationManager:
 
         self._waiting_commands.discard(device_id)
 
-        if detect_command_intent(normalized) == "hours":
+        intent = detect_command_intent(normalized)
+        if intent == "hours":
             current_time = get_current_time()
             info("Intenção: hours")
             technical("[ROUTER] intent=hours")
@@ -303,6 +304,31 @@ class ConversationManager:
                     "text": text,
                     "interaction_state": "idle",
                     "actions": [show_text("Agora sao", current_time, 3000)],
+                },
+                (),
+            )
+
+        if intent == "volume":
+            volume_percent = extract_volume_percent(normalized)
+            if volume_percent is None or volume_percent > 100:
+                return (
+                    {
+                        "text": "O volume deve estar entre 0 e 100%.",
+                        "interaction_state": "idle",
+                        "actions": [],
+                    },
+                    (),
+                )
+
+            info("Intenção: volume")
+            technical("[ROUTER] intent=volume")
+            technical(f"[INTENT] matched=volume percent={volume_percent}")
+            technical("[CONVERSATION] completed -> idle")
+            return (
+                {
+                    "text": f"Volume ajustado para {volume_percent}%.",
+                    "interaction_state": "idle",
+                    "actions": [set_volume(volume_percent)],
                 },
                 (),
             )

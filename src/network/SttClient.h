@@ -27,12 +27,13 @@ public:
 
     struct BackendAction
     {
-        enum class Type : uint8_t { None, Expression, ShowText };
+        enum class Type : uint8_t { None, Expression, ShowText, SetVolume };
         Type type = Type::None;
         String value;
         String line1;
         String line2;
         uint32_t durationMs = 0;
+        uint8_t volumePercent = 0;
     };
 
     struct BackendResponse

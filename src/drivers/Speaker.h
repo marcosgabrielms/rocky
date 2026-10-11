@@ -10,6 +10,8 @@ public:
     void playTestTone();
     bool beginPcmPlayback(uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels);
     bool playMonoPcm(const int16_t* samples, size_t sampleCount);
+    bool setVolumePercent(uint8_t percent);
+    uint8_t getVolumePercent() const;
     void stop();
 
 private:
@@ -20,14 +22,17 @@ private:
     static constexpr uint16_t TONE_FREQUENCY_HZ = 440;
     static constexpr uint32_t TONE_DURATION_MS = 1000;
     static constexpr int16_t TONE_AMPLITUDE = 3932;
-    static constexpr int32_t OUTPUT_VOLUME_PERCENT = 30;
+    static constexpr uint8_t DEFAULT_VOLUME_PERCENT = 70;
+    static constexpr const char* NVS_NAMESPACE = "koda_audio";
+    static constexpr const char* NVS_VOLUME_KEY = "volume";
     static constexpr size_t FRAMES_PER_BLOCK = 126;
     static constexpr size_t SAMPLES_PER_FRAME = 2;
 
     bool writeFrames(const int16_t* frames, size_t frameCount);
     void writeSilence();
-    static int16_t scaleOutputSample(int16_t sample);
+    int16_t scaleOutputSample(int16_t sample) const;
 
     I2SClass i2s{I2S_NUM_1};
     bool initialized = false;
+    uint8_t volumePercent = DEFAULT_VOLUME_PERCENT;
 };

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from services.commands import detect_command_intent, normalize_text
+from services.commands import detect_command_intent, extract_volume_percent, normalize_text
 from services.conversation import (
     CONTEXT_TTL_SECONDS,
     InteractionKind,
@@ -270,6 +270,37 @@ class ConversationTest(unittest.TestCase):
         for text in ("horário", "melhoras", "horas extras", "quantas horas tem um dia", "me diga a história"):
             with self.subTest(text=text):
                 self.assertIsNone(detect_command_intent(normalize_text(text)))
+
+    def test_volume_commands_are_deterministic_and_never_call_llm(self) -> None:
+        commands = {
+            "volume em 0%": 0,
+            "volume para 10%": 10,
+            "coloque o volume em 50%": 50,
+            "aumenta o volume para 80%": 80,
+            "abaixa o volume para 100%": 100,
+        }
+        for text, percent in commands.items():
+            with self.subTest(text=text):
+                decision = self.conversation.classify(
+                    f"Koda, {text}", "volume", interaction_mode=InteractionMode.WAKE
+                )
+                response = self.conversation.build_response_from_decision(decision)
+                self.assertEqual(decision.kind, InteractionKind.DETERMINISTIC)
+                self.assertEqual(response["text"], f"Volume ajustado para {percent}%.")
+                self.assertEqual(response["actions"], [{"type": "set_volume", "percent": percent}])
+                self.assertEqual(extract_volume_percent(normalize_text(text)), percent)
+        self.assertEqual(self.llm_client.calls, [])
+
+    def test_volume_outside_supported_range_is_rejected_without_llm(self) -> None:
+        for text in ("volume em 101%", "aumenta o volume para 255%", "volume para 1000%"):
+            with self.subTest(text=text):
+                decision = self.conversation.classify(
+                    f"Koda, {text}", "invalid-volume", interaction_mode=InteractionMode.WAKE
+                )
+                response = self.conversation.build_response_from_decision(decision)
+                self.assertEqual(response["text"], "O volume deve estar entre 0 e 100%.")
+                self.assertEqual(response["actions"], [])
+        self.assertEqual(self.llm_client.calls, [])
 
     def test_llm_decision_is_executed_once_without_reclassification(self) -> None:
         self.conversation.classify("Koda", "one-llm")

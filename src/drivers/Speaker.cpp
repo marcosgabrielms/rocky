@@ -1,6 +1,7 @@
 #include "Speaker.h"
 
 #include <math.h>
+#include <Preferences.h>
 
 namespace
 {
@@ -10,6 +11,16 @@ constexpr uint32_t SILENCE_BLOCKS = 4;
 
 bool Speaker::begin()
 {
+    Preferences preferences;
+    if (preferences.begin(NVS_NAMESPACE, true))
+    {
+        const uint8_t storedVolume = preferences.getUChar(NVS_VOLUME_KEY, DEFAULT_VOLUME_PERCENT);
+        preferences.end();
+        volumePercent = storedVolume <= 100 ? storedVolume : DEFAULT_VOLUME_PERCENT;
+    }
+    else
+        Serial.println("[SPEAKER] volume storage unavailable");
+
     i2s.setPins(BCLK_PIN, LRC_PIN, DATA_OUT_PIN);
     initialized = i2s.begin(I2S_MODE_STD,
                             SAMPLE_RATE,
@@ -25,7 +36,7 @@ bool Speaker::begin()
     }
 
     Serial.println("[SPEAKER] init ok");
-    Serial.printf("[AUDIO] output_volume=%ld%%\n", static_cast<long>(OUTPUT_VOLUME_PERCENT));
+    Serial.printf("[AUDIO] output_volume=%u%%\n", volumePercent);
     writeSilence();
     Serial.println("[SPEAKER] silence");
     return true;
@@ -50,7 +61,7 @@ void Speaker::playTestTone()
 
         for (size_t frame = 0; frame < framesInBlock; ++frame)
         {
-            const int16_t sample = static_cast<int16_t>(sinf(phase) * TONE_AMPLITUDE);
+            const int16_t sample = scaleOutputSample(static_cast<int16_t>(sinf(phase) * TONE_AMPLITUDE));
             frames[frame * SAMPLES_PER_FRAME] = sample;
             frames[frame * SAMPLES_PER_FRAME + 1] = sample;
             phase += phaseStep;
@@ -104,9 +115,39 @@ bool Speaker::playMonoPcm(const int16_t* samples, size_t sampleCount)
     return true;
 }
 
-int16_t Speaker::scaleOutputSample(int16_t sample)
+bool Speaker::setVolumePercent(uint8_t percent)
 {
-    const int32_t scaled = static_cast<int32_t>(sample) * OUTPUT_VOLUME_PERCENT / 100;
+    if (percent > 100)
+        return false;
+
+    volumePercent = percent;
+    Preferences preferences;
+    if (!preferences.begin(NVS_NAMESPACE, false))
+    {
+        Serial.println("[SPEAKER] volume persistence failed");
+        return false;
+    }
+
+    const bool persisted = preferences.putUChar(NVS_VOLUME_KEY, volumePercent) == sizeof(volumePercent);
+    preferences.end();
+    if (!persisted)
+    {
+        Serial.println("[SPEAKER] volume persistence failed");
+        return false;
+    }
+
+    Serial.printf("[AUDIO] output_volume=%u%%\n", volumePercent);
+    return true;
+}
+
+uint8_t Speaker::getVolumePercent() const
+{
+    return volumePercent;
+}
+
+int16_t Speaker::scaleOutputSample(int16_t sample) const
+{
+    const int32_t scaled = static_cast<int32_t>(sample) * volumePercent / 100;
     if (scaled > INT16_MAX)
         return INT16_MAX;
     if (scaled < INT16_MIN)

@@ -933,6 +933,14 @@ bool SttClient::extractBackendResponse(const String& json, BackendResponse& resp
             !extractJsonUnsigned(actionJson, "duration_ms", response.action.durationMs))
             return false;
     }
+    else if (type == "set_volume")
+    {
+        uint32_t volumePercent = 0;
+        if (!extractJsonUnsigned(actionJson, "percent", volumePercent) || volumePercent > 100)
+            return false;
+        response.action.type = BackendAction::Type::SetVolume;
+        response.action.volumePercent = static_cast<uint8_t>(volumePercent);
+    }
     else
         response.action.value = type;
 

@@ -62,3 +62,4 @@ server/.venv/
 server/dataset/
 server/calibration/
 server/local/tts/
+server/voice_lab/output/

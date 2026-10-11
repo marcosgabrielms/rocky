@@ -10,8 +10,11 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi.testclient import TestClient
 
 import app
+from koda_core import ConversationCoreAdapter
 from services.conversation import ConversationManager, InteractionDecision, InteractionKind, InteractionMode
 from services.audio_queue import RealtimeAudioQueue
+from services.llm.base import ConversationMessage
+from services.stt import TranscriptionResult
 from services.tts.realtime import RealtimeAudioSegment
 
 
@@ -30,6 +33,7 @@ class _ConversationDouble:
         self.classify_calls = 0
         self.execute_calls = 0
         self.received_at: float | None = None
+        self.classify_arguments: tuple[str, str, InteractionMode | None, bool] | None = None
 
     def capture_request_time(self) -> float:
         return 0.0
@@ -41,11 +45,12 @@ class _ConversationDouble:
                  interaction_mode: InteractionMode | None = None, low_confidence: bool = False) -> InteractionDecision:
         self.classify_calls += 1
         self.received_at = received_at
+        self.classify_arguments = (_text, _device_id, interaction_mode, low_confidence)
         return self.decision
 
     def build_response_from_decision(self, decision: InteractionDecision) -> dict[str, object]:
         self.execute_calls += 1
-        assert decision is self.decision
+        assert decision == self.decision
         return dict(self.response)
 
 
@@ -74,6 +79,15 @@ class _RealtimeAudioDouble:
 
 
 class RealtimeEndpointTest(TestCase):
+    @staticmethod
+    def core_adapter(conversation: object) -> ConversationCoreAdapter:
+        return ConversationCoreAdapter(
+            conversation,
+            decision_factory=InteractionDecision,
+            context_message_factory=ConversationMessage,
+            kind_factory=InteractionKind,
+        )
+
     def test_health_works_without_llm_key(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             response = TestClient(app.app).get("/health")
@@ -94,6 +108,7 @@ class RealtimeEndpointTest(TestCase):
                 thread.return_value.start.side_effect = RuntimeError("SECRET")
                 with (patch.object(app, "realtime_audio_service", service),
                       patch.object(app, "conversation_manager", conversation),
+                      patch.object(app, "conversation_core_adapter", self.core_adapter(conversation)),
                       patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
                       patch.object(app, "validate_wav", return_value=1.0),
                       patch.object(app, "transcribe_audio", return_value="Pergunta"),
@@ -116,6 +131,7 @@ class RealtimeEndpointTest(TestCase):
             tts = FakeTTS()
             service = RealtimeAudioService(conversation, RealtimeTTS(tts, Path(directory)))
             with (patch.object(app, "conversation_manager", conversation),
+                  patch.object(app, "conversation_core_adapter", self.core_adapter(conversation)),
                   patch.object(app, "realtime_audio_service", service),
                   patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
                   patch.object(app, "validate_wav", return_value=1.0),
@@ -147,6 +163,7 @@ class RealtimeEndpointTest(TestCase):
 
                 with (
                     patch.object(app, "conversation_manager", conversation),
+                    patch.object(app, "conversation_core_adapter", self.core_adapter(conversation)),
                     patch.object(app, "transcribe_audio", side_effect=slow_stt) as stt,
                     patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
                     patch.object(app, "validate_wav", return_value=1.0),
@@ -188,6 +205,7 @@ class RealtimeEndpointTest(TestCase):
         realtime_audio.direct_interaction_id = direct_interaction_id
         with (
             patch.object(app, "conversation_manager", conversation),
+            patch.object(app, "conversation_core_adapter", self.core_adapter(conversation)),
             patch.object(app, "realtime_audio_service", realtime_audio),
             patch.object(app, "transcribe_audio", return_value=decision.text),
             patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
@@ -224,6 +242,73 @@ class RealtimeEndpointTest(TestCase):
         self.assertEqual(response.json()["interaction_state"], "attention")
         self.assertEqual(conversation.classify_calls, 1)
         self.assertEqual(realtime_audio.create_calls, 0)
+
+    def test_realtime_creates_core_request_and_uses_direct_result(self) -> None:
+        direct = {"text": "Koda", "interaction_state": "attention", "actions": []}
+        decision = InteractionDecision(InteractionKind.WAKE, "Koda", "koda-core", direct)
+        conversation = _ConversationDouble(decision, direct)
+        realtime_audio = _RealtimeAudioDouble()
+        adapter = Mock(wraps=self.core_adapter(conversation))
+        transcription = TranscriptionResult("Koda", has_speech=True, low_confidence=True)
+
+        with (
+            patch.object(app, "conversation_manager", conversation),
+            patch.object(app, "conversation_core_adapter", adapter),
+            patch.object(app, "realtime_audio_service", realtime_audio),
+            patch.object(app, "transcribe_audio", return_value=transcription),
+            patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+            patch.object(app, "validate_wav", return_value=1.0),
+        ):
+            response = TestClient(app.app).post(
+                "/transcribe/realtime",
+                headers={
+                    "X-Rocky-Device": "koda-core",
+                    "X-Rocky-Interaction-Mode": "command",
+                },
+                files={"file": ("speech.wav", b"wav", "audio/wav")},
+            )
+
+        request = adapter.classify.call_args.args[0]
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(request.user_id, "local-user")
+        self.assertEqual(request.device_id, "koda-core")
+        self.assertEqual(request.input_type, "voice_transcript")
+        self.assertEqual(request.text, "Koda")
+        self.assertEqual(conversation.classify_arguments,
+                         ("Koda", "koda-core", InteractionMode.COMMAND, True))
+        adapter.build_direct_result.assert_called_once()
+        adapter.to_conversation_decision.assert_not_called()
+        self.assertEqual(conversation.classify_calls, 1)
+
+    def test_realtime_continues_llm_with_rebuilt_decision_without_reclassification(self) -> None:
+        context = (ConversationMessage(role="user", content="Quem criou o Linux?"),)
+        decision = InteractionDecision(InteractionKind.LLM, "E de onde ele e?", "koda-core", context=context)
+        conversation = _ConversationDouble(decision, {})
+        realtime_audio = _RealtimeAudioDouble()
+        adapter = Mock(wraps=self.core_adapter(conversation))
+
+        with (
+            patch.object(app, "conversation_manager", conversation),
+            patch.object(app, "conversation_core_adapter", adapter),
+            patch.object(app, "realtime_audio_service", realtime_audio),
+            patch.object(app, "transcribe_audio", return_value=decision.text),
+            patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+            patch.object(app, "validate_wav", return_value=1.0),
+            patch.object(app, "Thread", _ImmediateThread),
+        ):
+            response = TestClient(app.app).post(
+                "/transcribe/realtime",
+                headers={"X-Rocky-Device": "koda-core"},
+                files={"file": ("speech.wav", b"wav", "audio/wav")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        adapter.classify.assert_called_once()
+        adapter.build_direct_result.assert_not_called()
+        adapter.to_conversation_decision.assert_called_once()
+        self.assertEqual(conversation.classify_calls, 1)
+        self.assertEqual(realtime_audio.decisions, [decision])
+        self.assertEqual(realtime_audio.decisions[0].context, context)
 
     def test_deterministic_uses_realtime_interaction_without_local_playback(self) -> None:
         direct = {"text": "horas", "interaction_state": "idle", "actions": [{"type": "show_text", "line1": "Agora sao", "line2": "12:00", "duration_ms": 3000}]}

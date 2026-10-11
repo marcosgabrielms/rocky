@@ -14,6 +14,7 @@ from contextvars import copy_context
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
+from koda_core import ConversationCoreAdapter, InteractionRequest, InteractionResult
 from services.conversation import ConversationManager, InteractionKind, InteractionMode
 from services.llm import ChatGPTPlanLLMClient
 from services.realtime_audio import RealtimeAudioService
@@ -35,10 +36,12 @@ TTS_OUTPUT_PATH = TTS_DIRECTORY / "rocky_response.wav"
 REALTIME_TTS_DIRECTORY = TTS_DIRECTORY / "realtime"
 REALTIME_LONG_POLL_MAX_MS = 1000
 REALTIME_LONG_POLL_INTERVAL_MS = 50
+LOCAL_USER_ID = "local-user"
 
 app = FastAPI()
 llm_client = ChatGPTPlanLLMClient()
 conversation_manager = ConversationManager(0, llm_client)
+conversation_core_adapter = ConversationCoreAdapter(conversation_manager)
 tts_client = PiperTTS(TTS_MODEL_PATH)
 response_speaker = LocalResponseSpeaker(
     tts_client,
@@ -78,6 +81,15 @@ def _report_transcription_and_response(
     info(f'Ouvi: "{text}"')
     if spoken_text:
         info(f'Resposta: "{spoken_text}"')
+
+
+def _interaction_result_to_http_response(result: InteractionResult) -> dict[str, object]:
+    """Expõe somente o contrato HTTP já consumido pelo firmware."""
+    return {
+        "text": result.text,
+        "interaction_state": result.interaction_state,
+        "actions": [dict(action) for action in result.actions],
+    }
 
 
 @app.get("/health")
@@ -148,14 +160,23 @@ async def _transcribe_realtime(
     text, low_confidence = _conversation_input(transcription, use_wake_hotword)
     mark_latency("stt_done")
     latency_metric("stt_ms", "stt_start", "stt_done")
-    decision = conversation_manager.classify(
-        text, x_rocky_device, received_at=received_at, interaction_mode=interaction_mode,
+    request = InteractionRequest(
+        user_id=LOCAL_USER_ID,
+        device_id=x_rocky_device,
+        input_type="voice_transcript",
+        text=text,
+    )
+    core_decision = conversation_core_adapter.classify(
+        request, received_at=received_at, interaction_mode=interaction_mode,
         low_confidence=low_confidence,
     )
-    technical(f"[RTD] classify kind={decision.kind}")
-    if decision.kind is not InteractionKind.LLM:
-        response = conversation_manager.build_response_from_decision(decision)
-        _report_transcription_and_response(text, low_confidence, response, decision.kind)
+    technical(f"[RTD] classify kind={core_decision.kind}")
+    if core_decision.direct_result is not None:
+        result = conversation_core_adapter.build_direct_result(core_decision)
+        response = _interaction_result_to_http_response(result)
+        _report_transcription_and_response(
+            text, low_confidence, response, InteractionKind(core_decision.kind)
+        )
         interaction_id = realtime_audio_service.queue_direct_response(response, text)
         report_latency_summary()
         return {
@@ -165,6 +186,7 @@ async def _transcribe_realtime(
             "audio_available": False,
         }
 
+    decision = conversation_core_adapter.to_conversation_decision(core_decision)
     interaction_id = realtime_audio_service.create_interaction()
     info(f'Ouvi: "{text}"')
     technical(f"[RTD] interaction_created id={interaction_id}")

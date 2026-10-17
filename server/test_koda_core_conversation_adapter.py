@@ -29,12 +29,13 @@ class LegacyDecision:
     device_id: str
     direct_response: dict[str, object] | None = None
     context: tuple[LegacyMessage, ...] = ()
+    user_id: str = ""
 
 
 class StubConversationManager:
     def __init__(self, decision: LegacyDecision) -> None:
         self.decision = decision
-        self.classify_calls: list[tuple[str, str, float | None, object | None, bool]] = []
+        self.classify_calls: list[tuple[str, str, str | None, float | None, object | None, bool]] = []
         self.direct_calls: list[LegacyDecision] = []
         self.stream_calls: list[LegacyDecision] = []
 
@@ -43,20 +44,26 @@ class StubConversationManager:
         text: str,
         device_id: str,
         *,
+        user_id: str | None = None,
         received_at: float | None = None,
         interaction_mode: object | None = None,
         low_confidence: bool = False,
     ) -> LegacyDecision:
-        self.classify_calls.append((text, device_id, received_at, interaction_mode, low_confidence))
+        self.classify_calls.append((text, device_id, user_id, received_at, interaction_mode, low_confidence))
         return self.decision
 
     def build_response_from_decision(self, decision: LegacyDecision) -> dict[str, object]:
         self.direct_calls.append(decision)
-        if decision.direct_response is None:
-            raise ValueError("A direct response is required")
-        return decision.direct_response
+        return decision.direct_response or {
+            "text": "Resposta do modelo.",
+            "interaction_state": "idle",
+            "actions": [],
+        }
 
-    def build_stream_response_from_decision(self, decision: LegacyDecision) -> LegacyDecision:
+    def build_stream_response_from_decision(
+        self, decision: LegacyDecision, *, on_sentence: object | None = None
+    ) -> LegacyDecision:
+        del on_sentence
         self.stream_calls.append(decision)
         return decision
 
@@ -91,8 +98,9 @@ class ConversationCoreAdapterTest(unittest.TestCase):
             low_confidence=True,
         )
 
-        self.assertEqual(manager.classify_calls, [("Koda", "koda-01", 12.5, "wake", True)])
+        self.assertEqual(manager.classify_calls, [("Koda", "koda-01", "local-user", 12.5, "wake", True)])
         self.assertEqual(decision.device_id, "koda-01")
+        self.assertEqual(decision.user_id, "local-user")
 
     def test_all_legacy_kinds_convert_to_core_decisions(self) -> None:
         direct_response = {"text": "Koda", "interaction_state": "attention", "actions": []}
@@ -189,12 +197,25 @@ class ConversationCoreAdapterTest(unittest.TestCase):
             InteractionRequest("local-user", "koda-01", "text", "Quanto é dois mais dois?")
         )
 
-        continued = manager.build_stream_response_from_decision(adapter.to_conversation_decision(decision))
+        continued = adapter.build_stream_response(decision)
 
         self.assertEqual(len(manager.classify_calls), 1)
         self.assertEqual(len(manager.stream_calls), 1)
         self.assertEqual(continued.kind, LegacyKind.LLM)
         self.assertEqual(continued.context[0].content, "Olá")
+
+    def test_build_response_continues_llm_without_reclassification(self) -> None:
+        manager = StubConversationManager(
+            LegacyDecision(LegacyKind.LLM, "Pergunta", "koda-01")
+        )
+        adapter = make_adapter(manager)
+        decision = adapter.classify(InteractionRequest("local-user", "koda-01", "text", "Pergunta"))
+
+        result = adapter.build_response(decision)
+
+        self.assertEqual(len(manager.classify_calls), 1)
+        self.assertEqual(len(manager.direct_calls), 1)
+        self.assertEqual(result.text, "Resposta do modelo.")
 
     def test_llm_decision_cannot_be_consumed_as_a_direct_result(self) -> None:
         manager = StubConversationManager(

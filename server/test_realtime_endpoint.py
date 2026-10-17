@@ -10,8 +10,10 @@ from unittest.mock import AsyncMock, Mock, patch
 from fastapi.testclient import TestClient
 
 import app
-from koda_core import ConversationCoreAdapter
+from koda_core import ConversationCoreAdapter, CoreDecision, InteractionResult
 from services.conversation import ConversationManager, InteractionDecision, InteractionKind, InteractionMode
+from services.command_session import CommandSession
+from services.interaction import KodaInteractionService
 from services.audio_queue import RealtimeAudioQueue
 from services.llm.base import ConversationMessage
 from services.stt import TranscriptionResult
@@ -26,15 +28,32 @@ class _ImmediateThread:
         self._target()
 
 
+class _CurrentAppAdapter:
+    """Permite que os testes injetem o adapter mantido pela fronteira HTTP."""
+
+    def __getattr__(self, name: str):
+        return getattr(app.conversation_core_adapter, name)
+
+
 class _ConversationDouble:
     def __init__(self, decision: InteractionDecision, response: dict[str, object]) -> None:
         self.decision = decision
         self.response = response
         self.classify_calls = 0
         self.execute_calls = 0
+        self.stream_calls = 0
         self.received_at: float | None = None
         self.classify_arguments: tuple[str, str, InteractionMode | None, bool] | None = None
         self.built_decision: InteractionDecision | None = None
+
+    def assert_rebuilt_decision(self, decision: InteractionDecision) -> None:
+        """A fronteira preserva decisÃ£o legada e agora propaga a identidade lÃ³gica."""
+        assert decision.kind == self.decision.kind
+        assert decision.text == self.decision.text
+        assert decision.device_id == self.decision.device_id
+        assert decision.direct_response == self.decision.direct_response
+        assert decision.context == self.decision.context
+        assert decision.user_id == "local-user"
 
     def capture_request_time(self) -> float:
         return 0.0
@@ -42,8 +61,10 @@ class _ConversationDouble:
     def has_active_command_window(self, _device_id: str, *, received_at: float | None = None) -> bool:
         return False
 
-    def classify(self, _text: str, _device_id: str, *, received_at: float | None = None,
+    def classify(self, _text: str, _device_id: str, *, user_id: str | None = None,
+                 received_at: float | None = None,
                  interaction_mode: InteractionMode | None = None, low_confidence: bool = False) -> InteractionDecision:
+        del user_id
         self.classify_calls += 1
         self.received_at = received_at
         self.classify_arguments = (_text, _device_id, interaction_mode, low_confidence)
@@ -52,14 +73,23 @@ class _ConversationDouble:
     def build_response_from_decision(self, decision: InteractionDecision) -> dict[str, object]:
         self.execute_calls += 1
         self.built_decision = decision
-        assert decision == self.decision
+        self.assert_rebuilt_decision(decision)
         return dict(self.response)
+
+    def build_stream_response_from_decision(
+        self, decision: InteractionDecision, *, on_sentence: object | None = None
+    ) -> object:
+        del on_sentence
+        self.stream_calls += 1
+        self.assert_rebuilt_decision(decision)
+        return object()
 
 
 class _RealtimeAudioDouble:
     def __init__(self) -> None:
         self.create_calls = 0
         self.decisions: list[InteractionDecision] = []
+        self.core_decisions: list[object] = []
         self.direct_responses: list[tuple[dict[str, object], str]] = []
         self.direct_interaction_id: int | None = None
         self.audio_queue = Mock(spec=RealtimeAudioQueue)
@@ -75,12 +105,28 @@ class _RealtimeAudioDouble:
         assert interaction_id == 42
         return SimpleNamespace(audio_segments=())
 
+    def build_stream_audio_response_from_core_decision(
+        self, adapter: ConversationCoreAdapter, decision: object, interaction_id: int
+    ) -> SimpleNamespace:
+        self.core_decisions.append(decision)
+        adapter.build_stream_response(decision)
+        assert interaction_id == 42
+        return SimpleNamespace(audio_segments=())
+
     def queue_direct_response(self, response: dict[str, object], request_text: str) -> int | None:
         self.direct_responses.append((dict(response), request_text))
         return self.direct_interaction_id
 
 
 class RealtimeEndpointTest(TestCase):
+    def setUp(self) -> None:
+        session_patch = patch.object(app, "command_session", CommandSession())
+        session_patch.start()
+        self.addCleanup(session_patch.stop)
+        interaction_patch = patch.object(app, "interaction_service", KodaInteractionService(_CurrentAppAdapter()))
+        interaction_patch.start()
+        self.addCleanup(interaction_patch.stop)
+
     @staticmethod
     def core_adapter(conversation: object) -> ConversationCoreAdapter:
         return ConversationCoreAdapter(
@@ -89,6 +135,10 @@ class RealtimeEndpointTest(TestCase):
             context_message_factory=ConversationMessage,
             kind_factory=InteractionKind,
         )
+
+    @staticmethod
+    def interaction_service(adapter: object) -> KodaInteractionService:
+        return KodaInteractionService(adapter)
 
     def test_health_works_without_llm_key(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -103,7 +153,7 @@ class RealtimeEndpointTest(TestCase):
                 queue = RealtimeAudioQueue(Path(directory))
                 producer = Mock(side_effect=ConnectionResetError("SECRET"))
                 service = SimpleNamespace(audio_queue=queue, create_interaction=queue.create_interaction,
-                                          build_stream_audio_response_from_decision=producer)
+                                          build_stream_audio_response_from_core_decision=producer)
                 decision = InteractionDecision(InteractionKind.LLM, "Pergunta", "test")
                 conversation = _ConversationDouble(decision, {})
                 thread = Mock()
@@ -180,6 +230,83 @@ class RealtimeEndpointTest(TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json()["actions"][0]["line2"], "12:00")
                 self.assertFalse(stt.call_args.args[2])
+
+    def test_active_command_session_is_consulted_before_stt(self) -> None:
+        app.command_session.open("session-device")
+        response_data = {
+            "text": "horas",
+            "interaction_state": "idle",
+            "actions": [{"type": "show_text", "line1": "Agora sao", "line2": "12:00", "duration_ms": 3000}],
+        }
+        decision = InteractionDecision(InteractionKind.DETERMINISTIC, "horas", "session-device", response_data)
+        conversation = _ConversationDouble(decision, response_data)
+
+        with (
+            patch.object(app, "conversation_manager", conversation),
+            patch.object(app, "conversation_core_adapter", self.core_adapter(conversation)),
+            patch.object(app, "transcribe_audio", return_value="horas") as stt,
+            patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+            patch.object(app, "validate_wav", return_value=1.0),
+            patch.object(app.response_speaker, "speak_response", return_value=False),
+        ):
+            response = TestClient(app.app).post(
+                "/transcribe",
+                headers={"X-Rocky-Device": "session-device"},
+                files={"file": ("speech.wav", b"wav", "audio/wav")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(stt.call_args.args[2])
+        self.assertEqual(
+            conversation.classify_arguments,
+            ("horas", "session-device", InteractionMode.COMMAND, False),
+        )
+        self.assertFalse(app.command_session.is_active("session-device"))
+
+    def test_transcribe_delegates_conversation_to_interaction_service(self) -> None:
+        direct_result = InteractionResult(
+            text="Volume ajustado para 50%.",
+            interaction_state="idle",
+            actions=[{"type": "set_volume", "percent": 50}],
+        )
+        interaction_service = Mock()
+        interaction_service.classify.return_value = CoreDecision(
+            kind="deterministic",
+            text="volume em 50%",
+            device_id="interaction-service",
+            direct_result=direct_result,
+        )
+        interaction_service.build_response.return_value = direct_result
+        conversation = SimpleNamespace(capture_request_time=lambda: 0.0)
+
+        with (
+            patch.object(app, "conversation_manager", conversation),
+            patch.object(app, "interaction_service", interaction_service),
+            patch.object(app, "transcribe_audio", return_value="volume em 50%"),
+            patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+            patch.object(app, "validate_wav", return_value=1.0),
+            patch.object(app.response_speaker, "speak_response", return_value=False),
+        ):
+            response = TestClient(app.app).post(
+                "/transcribe",
+                headers={
+                    "X-Rocky-Device": "interaction-service",
+                    "X-Rocky-Interaction-Mode": "command",
+                },
+                files={"file": ("speech.wav", b"wav", "audio/wav")},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        interaction_service.classify.assert_called_once_with(
+            user_id="local-user",
+            device_id="interaction-service",
+            input_type="voice_transcript",
+            text="volume em 50%",
+            received_at=0.0,
+            interaction_mode=InteractionMode.COMMAND,
+            low_confidence=False,
+        )
+        interaction_service.build_response.assert_called_once_with(interaction_service.classify.return_value)
 
     def test_invalid_interaction_mode_is_rejected_before_stt(self) -> None:
         with patch.object(app, "transcribe_audio") as stt:
@@ -279,6 +406,7 @@ class RealtimeEndpointTest(TestCase):
         self.assertEqual(conversation.classify_arguments,
                          ("Koda", "koda-core", InteractionMode.COMMAND, True))
         adapter.build_direct_result.assert_called_once()
+        adapter.build_response.assert_not_called()
         adapter.to_conversation_decision.assert_not_called()
         self.assertEqual(conversation.classify_calls, 1)
 
@@ -322,7 +450,8 @@ class RealtimeEndpointTest(TestCase):
         self.assertEqual(response.json()["actions"], [{"type": "set_volume", "percent": 50}])
         self.assertTrue(response.json()["audio_available"])
         adapter.classify.assert_called_once()
-        adapter.build_direct_result.assert_called_once()
+        adapter.build_response.assert_called_once()
+        adapter.build_direct_result.assert_not_called()
         adapter.to_conversation_decision.assert_not_called()
         self.assertEqual(conversation.classify_calls, 1)
 
@@ -353,13 +482,17 @@ class RealtimeEndpointTest(TestCase):
         self.assertEqual(request.text, decision.text)
         self.assertEqual(conversation.classify_arguments,
                          (decision.text, "koda-core", None, False))
-        self.assertEqual(conversation.built_decision, decision)
+        self.assertEqual(conversation.built_decision.kind, decision.kind)
+        self.assertEqual(conversation.built_decision.text, decision.text)
+        self.assertEqual(conversation.built_decision.device_id, decision.device_id)
+        self.assertEqual(conversation.built_decision.user_id, "local-user")
         self.assertEqual(conversation.built_decision.context, context)
         self.assertEqual(response.json()["text"], "Ele nasceu na Finlandia.")
         self.assertFalse(response.json()["audio_available"])
         adapter.classify.assert_called_once()
         adapter.build_direct_result.assert_not_called()
-        adapter.to_conversation_decision.assert_called_once()
+        adapter.build_response.assert_called_once()
+        adapter.to_conversation_decision.assert_not_called()
         self.assertEqual(conversation.classify_calls, 1)
         self.assertEqual(conversation.execute_calls, 1)
 
@@ -388,10 +521,14 @@ class RealtimeEndpointTest(TestCase):
         self.assertEqual(response.status_code, 200)
         adapter.classify.assert_called_once()
         adapter.build_direct_result.assert_not_called()
-        adapter.to_conversation_decision.assert_called_once()
+        adapter.build_stream_response.assert_called_once()
+        adapter.to_conversation_decision.assert_not_called()
         self.assertEqual(conversation.classify_calls, 1)
-        self.assertEqual(realtime_audio.decisions, [decision])
-        self.assertEqual(realtime_audio.decisions[0].context, context)
+        self.assertEqual(conversation.stream_calls, 1)
+        self.assertEqual(
+            tuple((message.role, message.content) for message in realtime_audio.core_decisions[0].context),
+            tuple((message.role, message.content) for message in context),
+        )
 
     def test_deterministic_uses_realtime_interaction_without_local_playback(self) -> None:
         direct = {"text": "horas", "interaction_state": "idle", "actions": [{"type": "show_text", "line1": "Agora sao", "line2": "12:00", "duration_ms": 3000}]}
@@ -419,7 +556,10 @@ class RealtimeEndpointTest(TestCase):
         self.assertEqual(conversation.classify_calls, 1)
         self.assertEqual(conversation.execute_calls, 0)
         self.assertEqual(realtime_audio.create_calls, 1)
-        self.assertEqual(realtime_audio.decisions, [decision])
+        self.assertEqual(len(realtime_audio.core_decisions), 1)
+        self.assertEqual(realtime_audio.core_decisions[0].kind, InteractionKind.LLM.value)
+        self.assertEqual(realtime_audio.core_decisions[0].text, decision.text)
+        self.assertEqual(conversation.stream_calls, 1)
 
     def test_next_reports_pending_done_failed_cancelled_and_unknown(self) -> None:
         with TemporaryDirectory() as directory:

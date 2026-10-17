@@ -17,7 +17,7 @@ class LLMResult:
 
 @dataclass(frozen=True)
 class ConversationMessage:
-    role: Literal["user", "assistant"]
+    role: Literal["system", "user", "assistant"]
     content: str
 
 

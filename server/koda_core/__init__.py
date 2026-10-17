@@ -8,10 +8,14 @@ from .contracts import (
     InteractionResult,
     UsageRecord,
 )
+from .action_policy import ActionAuthorization, ActionPermission, ActionPolicy, PendingActionAuthorizations
 from .core import ConversationProcessor, KodaCore
 from .conversation_adapter import ConversationCoreAdapter
 
 __all__ = [
+    "ActionAuthorization",
+    "ActionPermission",
+    "ActionPolicy",
     "ConversationProcessor",
     "ConversationCoreAdapter",
     "CoreContextMessage",
@@ -20,5 +24,6 @@ __all__ = [
     "InteractionRequest",
     "InteractionResult",
     "KodaCore",
+    "PendingActionAuthorizations",
     "UsageRecord",
 ]

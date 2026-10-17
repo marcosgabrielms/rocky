@@ -16,6 +16,7 @@ VOLUME_COMMAND_PATTERN = re.compile(
     r"^(?:(?:(?:coloque|coloca)\s+)?(?:o\s+)?volume|(?:aumenta|abaixa)\s+(?:o\s+)?volume)"
     r"\s+(?:em|para)\s+(?P<percent>\d+)\s*%$"
 )
+SLEEP_ALIASES = frozenset({"vai dormir", "va dormir", "dorme"})
 
 
 def normalize_text(text: str) -> str:
@@ -23,6 +24,8 @@ def normalize_text(text: str) -> str:
 
 
 def detect_command_intent(normalized_text: str) -> str | None:
+    if normalized_text in SLEEP_ALIASES:
+        return "sleep"
     if normalized_text in HOURS_ALIASES:
         return "hours"
     if extract_volume_percent(normalized_text) is not None:

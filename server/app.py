@@ -7,15 +7,19 @@ import os
 import struct
 import time
 import wave
+from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 from threading import Thread
 from contextvars import copy_context
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
 
-from koda_core import ConversationCoreAdapter, InteractionRequest, InteractionResult
-from services.conversation import ConversationManager, InteractionKind, InteractionMode
+from koda_core import CoreDecision, InteractionResult
+from services.commands import normalize_text
+from services.conversation import InteractionKind, InteractionMode, extract_wake_command, is_wake_phrase
 from services.llm import ChatGPTPlanLLMClient
 from services.realtime_audio import RealtimeAudioService
 from services.stt import SAMPLE_RATE, TranscriptionResult, transcribe_with_quality as transcribe_audio, validate_wav
@@ -24,6 +28,7 @@ from services.audio_queue import AudioProductionStatus
 from services.latency import latency_metric, latency_scope, mark_latency, report_latency, report_latency_summary
 from services.runtime_log import error as log_error, info, technical
 from services.tts.response_speaker import get_spoken_text
+from runtime import KodaRuntime
 
 
 MAX_UPLOAD_BYTES = 1024 * 1024
@@ -38,10 +43,25 @@ REALTIME_LONG_POLL_MAX_MS = 1000
 REALTIME_LONG_POLL_INTERVAL_MS = 50
 LOCAL_USER_ID = "local-user"
 
-app = FastAPI()
 llm_client = ChatGPTPlanLLMClient()
-conversation_manager = ConversationManager(0, llm_client)
-conversation_core_adapter = ConversationCoreAdapter(conversation_manager)
+runtime = KodaRuntime.create(llm_client)
+
+
+@asynccontextmanager
+async def _runtime_lifespan(_: FastAPI):
+    """Mantem o scheduler local ativo somente durante a vida da API."""
+    runtime.reminder_scheduler.start()
+    try:
+        yield
+    finally:
+        runtime.reminder_scheduler.stop()
+
+
+app = FastAPI(lifespan=_runtime_lifespan)
+conversation_manager = runtime.conversation_manager
+conversation_core_adapter = runtime.conversation_core_adapter
+command_session = runtime.command_session
+interaction_service = runtime.interaction_service
 tts_client = PiperTTS(TTS_MODEL_PATH)
 response_speaker = LocalResponseSpeaker(
     tts_client,
@@ -52,6 +72,13 @@ realtime_audio_service = RealtimeAudioService(
     conversation_manager,
     RealtimeTTS(tts_client, REALTIME_TTS_DIRECTORY),
 )
+
+
+class TextInteractionPayload(BaseModel):
+    """Entrada textual de uma interface que jÃ¡ possui texto."""
+
+    text: str
+    device_id: str
 
 
 def _conversation_input(
@@ -92,9 +119,44 @@ def _interaction_result_to_http_response(result: InteractionResult) -> dict[str,
     }
 
 
+def _interaction_result_to_text_http_response(result: InteractionResult) -> dict[str, object]:
+    """ExpÃµe o resultado textual completo sem acionar efeitos do robÃ´."""
+    response = _interaction_result_to_http_response(result)
+    if result.provider is not None:
+        response["provider"] = result.provider
+    if result.model is not None:
+        response["model"] = result.model
+    if result.usage is not None:
+        response["usage"] = asdict(result.usage)
+    if result.metadata:
+        response["metadata"] = dict(result.metadata)
+    return response
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/interact")
+def interact(payload: TextInteractionPayload) -> dict[str, object]:
+    """Processa texto pronto sem depender do pipeline de Ã¡udio do robÃ´."""
+    text = payload.text.strip()
+    device_id = payload.device_id.strip()
+    if not text or not device_id:
+        raise HTTPException(status_code=422, detail="text e device_id devem ser preenchidos.")
+
+    core_decision = interaction_service.classify(
+        user_id=LOCAL_USER_ID,
+        device_id=device_id,
+        input_type="text",
+        text=text,
+        interaction_mode=InteractionMode.COMMAND,
+        low_confidence=False,
+    )
+    return _interaction_result_to_text_http_response(
+        interaction_service.build_response(core_decision)
+    )
 
 
 @app.post("/transcribe")
@@ -102,15 +164,22 @@ async def transcribe(
     file: UploadFile | None = File(default=None),
     x_rocky_device: str = Header(default="rocky-01"),
     x_rocky_interaction_mode: InteractionMode | None = Header(default=None),
+    x_rocky_device_state: str = Header(default="active"),
 ) -> dict[str, object]:
     received_at = conversation_manager.capture_request_time()
     with latency_scope():
-        return await _transcribe(file, x_rocky_device, received_at, x_rocky_interaction_mode)
+        return await _transcribe(
+            file,
+            x_rocky_device,
+            received_at,
+            x_rocky_interaction_mode,
+            _is_sleeping_device_state(x_rocky_device_state),
+        )
 
 
 async def _transcribe(
     file: UploadFile | None, x_rocky_device: str, received_at: float,
-    interaction_mode: InteractionMode | None = None,
+    interaction_mode: InteractionMode | None = None, device_sleeping: bool = False,
 ) -> dict[str, object]:
     audio_data = await read_wav_upload(file)
     duration_seconds = validate_wav(audio_data)
@@ -125,24 +194,16 @@ async def _transcribe(
     mark_latency("stt_done")
     latency_metric("stt_ms", "stt_start", "stt_done")
     technical("[STT] transcription completed")
-    request = InteractionRequest(
-        user_id=LOCAL_USER_ID,
-        device_id=x_rocky_device,
-        input_type="voice_transcript",
+    core_decision = _classify_conversation(
         text=text,
-    )
-    core_decision = conversation_core_adapter.classify(
-        request,
+        device_id=x_rocky_device,
         received_at=received_at,
         interaction_mode=interaction_mode,
         low_confidence=low_confidence,
+        device_sleeping=device_sleeping,
     )
-    if core_decision.direct_result is not None:
-        result = conversation_core_adapter.build_direct_result(core_decision)
-        response = _interaction_result_to_http_response(result)
-    else:
-        decision = conversation_core_adapter.to_conversation_decision(core_decision)
-        response = conversation_manager.build_response_from_decision(decision)
+    result = interaction_service.build_response(core_decision)
+    response = _interaction_result_to_http_response(result)
     _report_transcription_and_response(text, low_confidence, response)
     response["audio_available"] = response_speaker.speak_response(response, text)
     report_latency_summary()
@@ -154,15 +215,22 @@ async def transcribe_realtime(
     file: UploadFile | None = File(default=None),
     x_rocky_device: str = Header(default="rocky-01"),
     x_rocky_interaction_mode: InteractionMode | None = Header(default=None),
+    x_rocky_device_state: str = Header(default="active"),
 ) -> dict[str, object]:
     received_at = conversation_manager.capture_request_time()
     with latency_scope():
-        return await _transcribe_realtime(file, x_rocky_device, received_at, x_rocky_interaction_mode)
+        return await _transcribe_realtime(
+            file,
+            x_rocky_device,
+            received_at,
+            x_rocky_interaction_mode,
+            _is_sleeping_device_state(x_rocky_device_state),
+        )
 
 
 async def _transcribe_realtime(
     file: UploadFile | None, x_rocky_device: str, received_at: float,
-    interaction_mode: InteractionMode | None = None,
+    interaction_mode: InteractionMode | None = None, device_sleeping: bool = False,
 ) -> dict[str, object]:
     audio_data = await read_wav_upload(file)
     duration_seconds = validate_wav(audio_data)
@@ -174,19 +242,17 @@ async def _transcribe_realtime(
     text, low_confidence = _conversation_input(transcription, use_wake_hotword)
     mark_latency("stt_done")
     latency_metric("stt_ms", "stt_start", "stt_done")
-    request = InteractionRequest(
-        user_id=LOCAL_USER_ID,
-        device_id=x_rocky_device,
-        input_type="voice_transcript",
+    core_decision = _classify_conversation(
         text=text,
-    )
-    core_decision = conversation_core_adapter.classify(
-        request, received_at=received_at, interaction_mode=interaction_mode,
+        device_id=x_rocky_device,
+        received_at=received_at,
+        interaction_mode=interaction_mode,
         low_confidence=low_confidence,
+        device_sleeping=device_sleeping,
     )
     technical(f"[RTD] classify kind={core_decision.kind}")
     if core_decision.direct_result is not None:
-        result = conversation_core_adapter.build_direct_result(core_decision)
+        result = interaction_service.build_direct_response(core_decision)
         response = _interaction_result_to_http_response(result)
         _report_transcription_and_response(
             text, low_confidence, response, InteractionKind(core_decision.kind)
@@ -200,7 +266,6 @@ async def _transcribe_realtime(
             "audio_available": False,
         }
 
-    decision = conversation_core_adapter.to_conversation_decision(core_decision)
     interaction_id = realtime_audio_service.create_interaction()
     info(f'Ouvi: "{text}"')
     technical(f"[RTD] interaction_created id={interaction_id}")
@@ -208,7 +273,9 @@ async def _transcribe_realtime(
 
     def produce() -> None:
         try:
-            realtime_audio_service.build_stream_audio_response_from_decision(decision, interaction_id)
+            realtime_audio_service.build_stream_audio_response_from_core_decision(
+                interaction_service, core_decision, interaction_id,
+            )
         except Exception as exception:
             log_error("Falha ao gerar áudio realtime.")
             technical(f"[RTD] producer_error type={type(exception).__name__}")
@@ -239,7 +306,98 @@ async def _transcribe_realtime(
 def _use_wake_hotword(device_id: str, interaction_mode: InteractionMode | None) -> bool:
     if interaction_mode is not None:
         return interaction_mode == InteractionMode.WAKE
-    return not conversation_manager.has_active_command_window(device_id)
+    return not command_session.is_active(device_id)
+
+
+def _classify_conversation(
+    *,
+    text: str,
+    device_id: str,
+    received_at: float,
+    interaction_mode: InteractionMode | None,
+    low_confidence: bool,
+    device_sleeping: bool = False,
+):
+    """Conecta a sessão de dispositivo ao Core sem levar estado ao Core."""
+    if interaction_mode == InteractionMode.WAKE:
+        command_session.close(device_id)
+
+    effective_mode = interaction_mode
+    if effective_mode is None and command_session.is_active(device_id):
+        effective_mode = InteractionMode.COMMAND
+
+    if device_sleeping:
+        sleeping_decision = _sleeping_device_decision(text, device_id, effective_mode)
+        if sleeping_decision is not None:
+            command_session.close(device_id)
+            return sleeping_decision
+
+    core_decision = interaction_service.classify(
+        user_id=LOCAL_USER_ID,
+        device_id=device_id,
+        input_type="voice_transcript",
+        text=text,
+        received_at=received_at,
+        interaction_mode=effective_mode,
+        low_confidence=low_confidence,
+    )
+
+    if core_decision.kind == InteractionKind.WAKE.value:
+        command_session.open(device_id)
+    elif effective_mode == InteractionMode.COMMAND:
+        direct_result = core_decision.direct_result
+        if direct_result is None or direct_result.interaction_state != "attention":
+            command_session.close(device_id)
+
+    return core_decision
+
+
+def _is_sleeping_device_state(value: str) -> bool:
+    normalized = value.strip().casefold()
+    if normalized == "sleeping":
+        return True
+    if normalized == "active":
+        return False
+    raise HTTPException(status_code=422, detail="X-Rocky-Device-State invalido.")
+
+
+def _sleeping_device_decision(
+    text: str, device_id: str, interaction_mode: InteractionMode | None,
+) -> CoreDecision | None:
+    """Barreira de dispositivo: evita Core/LLM para fala comum durante o sono."""
+    normalized = normalize_text(text)
+    wake_command = extract_wake_command(text)
+    if wake_command == "acorda" or (
+        interaction_mode is InteractionMode.COMMAND and normalized == "acorda"
+    ):
+        return _sleeping_direct_decision(
+            "deterministic",
+            text,
+            device_id,
+            "Acordando.",
+            [{"type": "set_device_state", "state": "active"}],
+        )
+
+    if interaction_mode is InteractionMode.WAKE and is_wake_phrase(text):
+        return None
+
+    return _sleeping_direct_decision("empty", text, device_id, "", [])
+
+
+def _sleeping_direct_decision(
+    kind: str, text: str, device_id: str, response_text: str, actions: list[dict[str, object]],
+) -> CoreDecision:
+    return CoreDecision(
+        kind=kind,
+        text=text,
+        device_id=device_id,
+        user_id=LOCAL_USER_ID,
+        direct_result=InteractionResult(
+            text=response_text,
+            interaction_state="idle",
+            actions=actions,
+        ),
+    )
 
 
 @app.get("/realtime/audio/{interaction_id}/next")

@@ -63,6 +63,7 @@ class CoreDecision:
     device_id: str
     direct_result: InteractionResult | None = None
     context: tuple[CoreContextMessage, ...] = ()
+    user_id: str = ""
 
 
 @dataclass(frozen=True)

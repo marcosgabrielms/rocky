@@ -19,7 +19,9 @@ if "piper" not in sys.modules:
     sys.modules["piper"] = piper_module
 
 from services.audio_queue import AudioProductionStatus
-from services.conversation import ConversationManager, InteractionKind, LLM_UNAVAILABLE_MESSAGE, LLM_INTERRUPTED_MESSAGE
+from services.conversation import (
+    ConversationManager, InteractionKind, InteractionMode, LLM_UNAVAILABLE_MESSAGE, LLM_INTERRUPTED_MESSAGE,
+)
 from services.llm import ConversationMessage, LLMError, LLMResult, OpenRouterLLMClient
 from services.realtime_audio import RealtimeAudioService
 from services.tts.realtime import RealtimeTTS
@@ -167,13 +169,23 @@ class RealtimeAudioTest(unittest.TestCase):
 
     @staticmethod
     def wake(service: RealtimeAudioService, device_id: str) -> None:
-        service.build_stream_audio_response("Koda", device_id)
+        decision = service._conversation_manager.classify("Koda", device_id, interaction_mode=InteractionMode.WAKE)
+        service.build_stream_audio_response_from_decision(decision)
+
+    @staticmethod
+    def command(
+        service: RealtimeAudioService, text: str, device_id: str, interaction_id: int | None = None,
+    ):
+        decision = service._conversation_manager.classify(
+            text, device_id, interaction_mode=InteractionMode.COMMAND,
+        )
+        return service.build_stream_audio_response_from_decision(decision, interaction_id)
 
     def test_one_sentence_generates_one_ordered_segment(self) -> None:
         service, llm, tts = self.build_service(("Olá.",))
         self.wake(service, "one")
 
-        result = service.build_stream_audio_response("Pergunta", "one")
+        result = self.command(service, "Pergunta", "one")
 
         self.assertEqual(llm.stream_calls, 1)
         self.assertEqual(tts.calls, ["Olá."])
@@ -187,7 +199,7 @@ class RealtimeAudioTest(unittest.TestCase):
     def test_markdown_is_cleaned_before_fake_piper_without_changing_backend_text(self) -> None:
         service, llm, tts = self.build_service(("**Linus Torvalds** criou o Linux.",))
         self.wake(service, "markdown")
-        result = service.build_stream_audio_response("Quem criou o Linux?", "markdown")
+        result = self.command(service, "Quem criou o Linux?", "markdown")
         self.assertEqual(tts.calls, ["Linus Torvalds criou o Linux."])
         self.assertEqual(result.conversation.response["text"], "**Linus Torvalds** criou o Linux.")
         self.assertEqual(llm.stream_calls, 1)
@@ -195,7 +207,7 @@ class RealtimeAudioTest(unittest.TestCase):
     def test_skipped_code_sentence_keeps_audio_sequences_contiguous(self) -> None:
         service, llm, tts = self.build_service(("```python\nprint('Codigo.')\n```.", " Resposta: Linux é livre."))
         self.wake(service, "skip-code")
-        result = service.build_stream_audio_response("Pergunta", "skip-code")
+        result = self.command(service, "Pergunta", "skip-code")
         self.assertEqual(tts.calls, ["Linux é livre."])
         self.assertEqual([segment.sequence for segment in result.audio_segments], [0])
         self.assertEqual(llm.stream_calls, 1)
@@ -211,7 +223,7 @@ class RealtimeAudioTest(unittest.TestCase):
             yield " Segunda."
 
         with patch.object(llm, "stream_response", side_effect=chunks):
-            service.build_stream_audio_response("Pergunta", "incremental-guard")
+            self.command(service, "Pergunta", "incremental-guard")
         self.assertEqual(tts.calls, ["Primeira.", "Segunda."])
 
     def test_only_code_or_url_produces_no_audio_without_retry(self) -> None:
@@ -219,7 +231,7 @@ class RealtimeAudioTest(unittest.TestCase):
             with self.subTest(text=text):
                 service, llm, tts = self.build_service((text,))
                 self.wake(service, "no-speech")
-                result = service.build_stream_audio_response("Pergunta", "no-speech")
+                result = self.command(service, "Pergunta", "no-speech")
                 self.assertEqual(tts.calls, [])
                 self.assertEqual(result.audio_segments, ())
                 self.assertFalse(result.tts_failed)
@@ -238,7 +250,7 @@ class RealtimeAudioTest(unittest.TestCase):
             yield "Segunda."
 
         with patch.object(llm, "stream_response", side_effect=chunks), redirect_stdout(output), latency_scope():
-            result = service.build_stream_audio_response("Pergunta", "latency")
+            result = self.command(service, "Pergunta", "latency")
 
         self.assertEqual(llm.stream_calls, 1)
         self.assertEqual(len(result.audio_segments), 2)
@@ -247,8 +259,10 @@ class RealtimeAudioTest(unittest.TestCase):
 
     def test_preclassified_llm_decision_is_not_classified_again(self) -> None:
         service, llm, _ = self.build_service(("Resposta.",))
-        service.build_stream_audio_response("Koda", "preclassified")
-        decision = service._conversation_manager.classify("Pergunta", "preclassified")
+        self.wake(service, "preclassified")
+        decision = service._conversation_manager.classify(
+            "Pergunta", "preclassified", interaction_mode=InteractionMode.COMMAND,
+        )
 
         self.assertEqual(decision.kind, InteractionKind.LLM)
         with patch.object(
@@ -263,7 +277,7 @@ class RealtimeAudioTest(unittest.TestCase):
 
     def test_preclassified_wake_or_empty_never_starts_realtime_generation(self) -> None:
         service, llm, tts = self.build_service(("Não deve ser usado.",))
-        wake = service._conversation_manager.classify("Koda", "safe-decision")
+        wake = service._conversation_manager.classify("Koda", "safe-decision", interaction_mode=InteractionMode.WAKE)
         empty = service._conversation_manager.classify("", "empty-decision")
 
         wake_result = service.build_stream_audio_response_from_decision(wake)
@@ -280,7 +294,7 @@ class RealtimeAudioTest(unittest.TestCase):
         service, _, tts = self.build_service(("Primeira. Segunda? Terceira!",))
         self.wake(service, "multiple")
 
-        result = service.build_stream_audio_response("Pergunta", "multiple")
+        result = self.command(service, "Pergunta", "multiple")
 
         self.assertEqual(tts.calls, ["Primeira.", "Segunda?", "Terceira!"])
         self.assertEqual([segment.sequence for segment in result.audio_segments], [0, 1, 2])
@@ -289,7 +303,7 @@ class RealtimeAudioTest(unittest.TestCase):
         service, _, tts = self.build_service(("Olá", ", tudo", " bem?"))
         self.wake(service, "chunks")
 
-        service.build_stream_audio_response("Pergunta", "chunks")
+        self.command(service, "Pergunta", "chunks")
 
         self.assertEqual(tts.calls, ["Olá, tudo bem?"])
 
@@ -297,7 +311,7 @@ class RealtimeAudioTest(unittest.TestCase):
         service, _, tts = self.build_service(("Resposta sem ponto",))
         self.wake(service, "residual")
 
-        result = service.build_stream_audio_response("Pergunta", "residual")
+        result = self.command(service, "Pergunta", "residual")
 
         self.assertEqual(tts.calls, ["Resposta sem ponto"])
         self.assertEqual(result.conversation.sentences, ("Resposta sem ponto",))
@@ -306,7 +320,7 @@ class RealtimeAudioTest(unittest.TestCase):
         service, _, tts = self.build_service(("", "  ", "\n"))
         self.wake(service, "empty")
 
-        result = service.build_stream_audio_response("Pergunta", "empty")
+        result = self.command(service, "Pergunta", "empty")
 
         self.assertEqual(tts.calls, [LLM_UNAVAILABLE_MESSAGE])
         self.assertEqual(len(result.audio_segments), 1)
@@ -315,7 +329,7 @@ class RealtimeAudioTest(unittest.TestCase):
         service, llm, tts = self.build_service(("Primeira. Segunda.",), fail_on_call=1)
         self.wake(service, "tts-first-error")
 
-        result = service.build_stream_audio_response("Pergunta", "tts-first-error")
+        result = self.command(service, "Pergunta", "tts-first-error")
 
         self.assertEqual(llm.stream_calls, 1)
         self.assertEqual(tts.calls, ["Primeira."])
@@ -331,7 +345,7 @@ class RealtimeAudioTest(unittest.TestCase):
         service, _, tts = self.build_service(("Primeira. Segunda. Terceira.",), fail_on_call=2)
         self.wake(service, "tts-second-error")
 
-        result = service.build_stream_audio_response("Pergunta", "tts-second-error")
+        result = self.command(service, "Pergunta", "tts-second-error")
 
         self.assertEqual(tts.calls, ["Primeira.", "Segunda."])
         self.assertTrue(result.tts_failed)
@@ -341,7 +355,7 @@ class RealtimeAudioTest(unittest.TestCase):
         service, llm, tts = self.build_service(("Resposta válida.",), LLMError("stream interrompido"))
         self.wake(service, "partial-llm")
 
-        result = service.build_stream_audio_response("Pergunta", "partial-llm")
+        result = self.command(service, "Pergunta", "partial-llm")
 
         self.assertEqual(llm.stream_calls, 1)
         self.assertEqual(tts.calls, ["Resposta válida.", LLM_INTERRUPTED_MESSAGE])
@@ -356,7 +370,7 @@ class RealtimeAudioTest(unittest.TestCase):
         service, llm, tts = self.build_service((), LLMError("OpenRouter HTTP 429"))
         self.wake(service, "unavailable")
 
-        result = service.build_stream_audio_response("Pergunta", "unavailable")
+        result = self.command(service, "Pergunta", "unavailable")
 
         self.assertEqual(llm.stream_calls, 1)
         self.assertEqual(tts.calls, [LLM_UNAVAILABLE_MESSAGE])
@@ -374,7 +388,7 @@ class RealtimeAudioTest(unittest.TestCase):
                 interaction_id = service.create_interaction()
                 logs = io.StringIO()
                 with redirect_stdout(logs):
-                    result = service.build_stream_audio_response("Pergunta", "network-error", interaction_id)
+                    result = self.command(service, "Pergunta", "network-error", interaction_id)
                 self.assertEqual(llm.stream_calls, 1)
                 self.assertEqual(tts.calls, [LLM_UNAVAILABLE_MESSAGE])
                 self.assertTrue(result.conversation.stream_failed)
@@ -386,7 +400,7 @@ class RealtimeAudioTest(unittest.TestCase):
         self.wake(service, "setup-error")
         interaction_id = service.create_interaction()
         with patch.object(service._realtime_tts, "begin_interaction", side_effect=OSError("SECRET")):
-            result = service.build_stream_audio_response("Pergunta", "setup-error", interaction_id)
+            result = self.command(service, "Pergunta", "setup-error", interaction_id)
         self.assertTrue(result.tts_failed)
         self.assertEqual(service.audio_queue.state(interaction_id).production_status, AudioProductionStatus.FAILED)
 
@@ -414,13 +428,26 @@ class RealtimeAudioTest(unittest.TestCase):
         self.assertEqual(service.audio_queue.state(result.interaction_id).production_status, AudioProductionStatus.FAILED)
 
     def test_base_exception_propagates_but_queue_is_not_left_active(self) -> None:
-        for error in (KeyboardInterrupt(), SystemExit()):
-            with self.subTest(error=type(error).__name__):
-                service, _, _ = self.build_service((), error)
+        for error_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(error=error_type.__name__, source="legacy"):
+                service, _, _ = self.build_service((), error_type())
                 self.wake(service, "interrupt")
                 interaction_id = service.create_interaction()
-                with self.assertRaises(type(error)):
-                    service.build_stream_audio_response("Pergunta", "interrupt", interaction_id)
+                with self.assertRaises(error_type):
+                    self.command(service, "Pergunta", "interrupt", interaction_id)
+                self.assertEqual(service.audio_queue.state(interaction_id).production_status, AudioProductionStatus.FAILED)
+
+            class InterruptingCoreAdapter:
+                def build_stream_response(self, *_args, **_kwargs) -> object:
+                    raise error_type()
+
+            with self.subTest(error=error_type.__name__, source="core"):
+                service, _, _ = self.build_service(())
+                interaction_id = service.create_interaction()
+                with self.assertRaises(error_type):
+                    service.build_stream_audio_response_from_core_decision(
+                        InterruptingCoreAdapter(), object(), interaction_id,
+                    )
                 self.assertEqual(service.audio_queue.state(interaction_id).production_status, AudioProductionStatus.FAILED)
 
     def test_partial_tts_artifact_is_removed_on_failure(self) -> None:
@@ -432,7 +459,7 @@ class RealtimeAudioTest(unittest.TestCase):
             raise OSError("falha simulada")
 
         with patch.object(tts, "synthesize_to_wav", side_effect=fail):
-            result = service.build_stream_audio_response("Pergunta", "partial-file")
+            result = self.command(service, "Pergunta", "partial-file")
         self.assertTrue(result.tts_failed)
         self.assertEqual(list(self.output_directory.glob("rocky_rt_*.wav")), [])
 
@@ -465,7 +492,7 @@ class RealtimeAudioTest(unittest.TestCase):
         self.wake(service, "hours")
 
         with patch("services.conversation.get_current_time", return_value="12:00"):
-            result = service.build_stream_audio_response("horas", "hours")
+            result = self.command(service, "horas", "hours")
 
         self.assertEqual(llm.stream_calls, 0)
         self.assertEqual(tts.calls, [])
@@ -492,12 +519,12 @@ class RealtimeAudioTest(unittest.TestCase):
     def test_new_interaction_preserves_wav_that_is_still_queued(self) -> None:
         service, _, _ = self.build_service(("Primeira.",))
         self.wake(service, "cleanup")
-        first = service.build_stream_audio_response("Pergunta", "cleanup")
+        first = self.command(service, "Pergunta", "cleanup")
         preserved_voice = self.output_directory / "pt_BR-jeff-medium.onnx"
         preserved_voice.write_bytes(b"voice")
 
         self.wake(service, "cleanup")
-        second = service.build_stream_audio_response("Outra pergunta", "cleanup")
+        second = self.command(service, "Outra pergunta", "cleanup")
 
         self.assertTrue(preserved_voice.exists())
         self.assertTrue(first.audio_segments[0].audio_path.exists())

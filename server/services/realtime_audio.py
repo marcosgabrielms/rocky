@@ -1,5 +1,6 @@
 """Coordena LLM streaming e síntese local por sentença, sem transporte físico."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from models.actions import BackendResponse
@@ -86,6 +87,27 @@ class RealtimeAudioService:
     def build_stream_audio_response_from_decision(
         self, decision: InteractionDecision, interaction_id: int | None = None
     ) -> StreamedAudioResponse:
+        return self._build_stream_audio_response(
+            lambda on_sentence: self._conversation_manager.build_stream_response_from_decision(
+                decision, on_sentence=on_sentence,
+            ),
+            interaction_id,
+        )
+
+    def build_stream_audio_response_from_core_decision(
+        self, adapter: object, decision: object, interaction_id: int | None = None
+    ) -> StreamedAudioResponse:
+        """Consome uma decisão do Core sem expor a decisão legada ao HTTP."""
+        return self._build_stream_audio_response(
+            lambda on_sentence: adapter.build_stream_response(decision, on_sentence=on_sentence),
+            interaction_id,
+        )
+
+    def _build_stream_audio_response(
+        self,
+        build_conversation: Callable[[Callable[[str, int, int], None]], StreamedConversationResponse],
+        interaction_id: int | None,
+    ) -> StreamedAudioResponse:
         session: RealtimeTTSSession | None = None
         segments: list[RealtimeAudioSegment] = []
         conversation: StreamedConversationResponse | None = None
@@ -127,9 +149,7 @@ class RealtimeAudioService:
 
         try:
             try:
-                conversation = self._conversation_manager.build_stream_response_from_decision(
-                    decision, on_sentence=synthesize_sentence,
-                )
+                conversation = build_conversation(synthesize_sentence)
             except Exception as error:
                 log_error("Falha ao processar resposta realtime.")
                 technical(f"[RT] producer_error type={type(error).__name__}")

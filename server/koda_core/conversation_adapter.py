@@ -50,20 +50,33 @@ class ConversationCoreAdapter:
         decision = self._conversation_manager.classify(
             request.text,
             request.device_id,
+            user_id=request.user_id,
             received_at=received_at,
             interaction_mode=interaction_mode,
             low_confidence=low_confidence,
         )
-        return self._to_core_decision(decision)
+        return self._to_core_decision(decision, request.user_id)
 
     def build_direct_result(self, decision: CoreDecision) -> InteractionResult:
         """Constrói uma resposta direta pela API legada sem classificar novamente."""
         if decision.direct_result is None:
             raise ValueError("A decisão não possui resposta direta")
+        return self.build_response(decision)
+
+    def build_response(self, decision: CoreDecision) -> InteractionResult:
+        """Constrói uma resposta completa sem expor a decisão legada ao runtime."""
         response = self._conversation_manager.build_response_from_decision(
             self.to_conversation_decision(decision)
         )
         return self._to_interaction_result(response)
+
+    def build_stream_response(
+        self, decision: CoreDecision, *, on_sentence: Callable[..., None] | None = None
+    ) -> object:
+        """Continua uma resposta em streaming sem classificar novamente."""
+        return self._conversation_manager.build_stream_response_from_decision(
+            self.to_conversation_decision(decision), on_sentence=on_sentence,
+        )
 
     def to_conversation_decision(self, decision: CoreDecision) -> object:
         """Reconstrói uma decisão legada equivalente para continuidade existente."""
@@ -82,9 +95,10 @@ class ConversationCoreAdapter:
             device_id=decision.device_id,
             direct_response=direct_response,
             context=context,
+            user_id=decision.user_id,
         )
 
-    def _to_core_decision(self, decision: object) -> CoreDecision:
+    def _to_core_decision(self, decision: object, user_id: str) -> CoreDecision:
         kind = getattr(decision, "kind").value
         direct_response = getattr(decision, "direct_response")
         context = tuple(
@@ -101,6 +115,7 @@ class ConversationCoreAdapter:
                 else None
             ),
             context=context,
+            user_id=getattr(decision, "user_id", "") or user_id,
         )
 
     @staticmethod
@@ -115,6 +130,8 @@ class ConversationCoreAdapter:
         provider = response.get("provider")
         model = response.get("model")
         usage = response.get("usage")
+        raw_metadata = response.get("metadata", {})
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
         return InteractionResult(
             text=text if isinstance(text, str) else "",
             interaction_state=interaction_state if isinstance(interaction_state, str) else "idle",
@@ -122,12 +139,16 @@ class ConversationCoreAdapter:
             provider=provider if isinstance(provider, str) else None,
             model=model if isinstance(model, str) else None,
             usage=usage if isinstance(usage, UsageRecord) else None,
+            metadata=metadata,
         )
 
     @staticmethod
     def _to_direct_response(result: InteractionResult) -> dict[str, object]:
-        return {
+        response: dict[str, object] = {
             "text": result.text,
             "interaction_state": result.interaction_state,
             "actions": [dict(action) for action in result.actions],
         }
+        if result.metadata:
+            response["metadata"] = dict(result.metadata)
+        return response

@@ -10,7 +10,14 @@ from enum import StrEnum
 from zoneinfo import ZoneInfo
 
 from models.actions import BackendResponse, expression, idle_response, set_device_state, set_volume, show_text
-from services.commands import detect_command_intent, extract_volume_percent, get_current_time, normalize_text
+from services.commands import (
+    DeviceStateIntent,
+    detect_command_intent,
+    detect_device_state_intent,
+    extract_volume_percent,
+    get_current_time,
+    normalize_text,
+)
 from services.conversation_context import (
     CONTEXT_TTL_SECONDS,
     MAX_CONTEXT_MESSAGES,
@@ -292,6 +299,9 @@ class ConversationManager:
                 technical("[CONVERSATION] wake matched with command")
                 text = command
                 interaction_mode = InteractionMode.COMMAND
+            elif detect_device_state_intent(text, require_wake_word=True) is not None:
+                technical("[CONVERSATION] wake matched with device state command")
+                interaction_mode = InteractionMode.COMMAND
         conversation_user_id = user_id or device_id
         direct_response, context = self._prepare_response(
             text, conversation_user_id, interaction_mode=interaction_mode, low_confidence=low_confidence,
@@ -476,6 +486,18 @@ class ConversationManager:
                     "text": "Vou dormir.",
                     "interaction_state": "idle",
                     "actions": [set_device_state("sleeping")],
+                },
+                (),
+            )
+
+        if intent == "wake":
+            technical("[ROUTER] intent=wake")
+            technical("[INTENT] matched=wake")
+            return (
+                {
+                    "text": "Ja estou acordado.",
+                    "interaction_state": "attention",
+                    "actions": [],
                 },
                 (),
             )

@@ -108,14 +108,28 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(self.llm_client.calls, [])
 
     def test_sleep_command_is_deterministic_and_never_calls_the_llm(self) -> None:
-        decision = self.conversation.classify(
-            "Koda, vai dormir", "sleep-test", interaction_mode=InteractionMode.WAKE,
-        )
-        response = self.conversation.build_response_from_decision(decision)
+        for text in (
+            "Koda, vai dormir", "Koda, pode dormir", "Koda, dorme", "Koda, vá dormir",
+            "Koda, descansa", "pode dormir, Koda",
+        ):
+            with self.subTest(text=text):
+                decision = self.conversation.classify(text, "sleep-test", interaction_mode=InteractionMode.WAKE)
+                response = self.conversation.build_response_from_decision(decision)
 
-        self.assertEqual(decision.kind, InteractionKind.DETERMINISTIC)
-        self.assertEqual(response["text"], "Vou dormir.")
-        self.assertEqual(response["actions"], [{"type": "set_device_state", "state": "sleeping"}])
+                self.assertEqual(decision.kind, InteractionKind.DETERMINISTIC)
+                self.assertEqual(response["text"], "Vou dormir.")
+                self.assertEqual(response["actions"], [{"type": "set_device_state", "state": "sleeping"}])
+        self.assertEqual(self.llm_client.calls, [])
+
+    def test_wake_device_command_is_deterministic_and_never_calls_the_llm(self) -> None:
+        for text in ("Koda, acorda", "Koda pode acordar", "acorda, Koda"):
+            with self.subTest(text=text):
+                decision = self.conversation.classify(text, "wake-device", interaction_mode=InteractionMode.WAKE)
+                response = self.conversation.build_response_from_decision(decision)
+
+                self.assertEqual(response["text"], "Ja estou acordado.")
+                self.assertEqual(response["interaction_state"], "attention")
+                self.assertEqual(response["actions"], [])
         self.assertEqual(self.llm_client.calls, [])
 
     def test_any_valid_question_after_koda_reaches_llm_once_without_wake_in_history(self) -> None:

@@ -231,6 +231,76 @@ class RealtimeEndpointTest(TestCase):
                 self.assertEqual(response.json()["actions"][0]["line2"], "12:00")
                 self.assertFalse(stt.call_args.args[2])
 
+    def test_realtime_post_wake_device_state_commands_bypass_core_and_llm(self) -> None:
+        cases = (
+            (
+                "sleep-cycle",
+                "active",
+                "vai dormir",
+                {"type": "set_device_state", "state": "sleeping"},
+            ),
+            (
+                "sleep-cycle-dorme",
+                "active",
+                "dorme",
+                {"type": "set_device_state", "state": "sleeping"},
+            ),
+            (
+                "awake-cycle",
+                "sleeping",
+                "acorda",
+                {"type": "set_device_state", "state": "active"},
+            ),
+        )
+        for device_id, device_state, command, expected_action in cases:
+            with self.subTest(command=command):
+                llm = SimpleNamespace(ask=lambda *_args, **_kwargs: self.fail("device state nao chama LLM"))
+                conversation = ConversationManager(0, llm)
+                adapter = self.core_adapter(conversation)
+                interaction_service = self.interaction_service(adapter)
+                audio = _RealtimeAudioDouble()
+                transcriptions = (
+                    TranscriptionResult("Koda", has_speech=True, low_confidence=False),
+                    TranscriptionResult(command, has_speech=True, low_confidence=False),
+                )
+
+                with (
+                    patch.object(app, "conversation_manager", conversation),
+                    patch.object(app, "conversation_core_adapter", adapter),
+                    patch.object(app, "interaction_service", interaction_service),
+                    patch.object(app, "realtime_audio_service", audio),
+                    patch.object(app, "transcribe_audio", side_effect=transcriptions),
+                    patch.object(app, "read_wav_upload", AsyncMock(return_value=b"wav")),
+                    patch.object(app, "validate_wav", return_value=1.0),
+                    patch.object(interaction_service, "classify", wraps=interaction_service.classify) as classify,
+                ):
+                    client = TestClient(app.app)
+                    wake = client.post(
+                        "/transcribe/realtime",
+                        headers={
+                            "X-Rocky-Device": device_id,
+                            "X-Rocky-Interaction-Mode": "wake",
+                            "X-Rocky-Device-State": device_state,
+                        },
+                        files={"file": ("speech.wav", b"wav", "audio/wav")},
+                    )
+                    command_response = client.post(
+                        "/transcribe/realtime",
+                        headers={
+                            "X-Rocky-Device": device_id,
+                            "X-Rocky-Interaction-Mode": "command",
+                            "X-Rocky-Device-State": device_state,
+                        },
+                        files={"file": ("speech.wav", b"wav", "audio/wav")},
+                    )
+
+                self.assertEqual(wake.status_code, 200)
+                self.assertEqual(wake.json()["interaction_state"], "attention")
+                self.assertEqual(command_response.status_code, 200)
+                self.assertEqual(command_response.json()["actions"], [expected_action])
+                self.assertEqual(command_response.json()["interaction_state"], "attention" if device_state == "sleeping" else "idle")
+                self.assertEqual(classify.call_count, 1)
+
     def test_active_command_session_is_consulted_before_stt(self) -> None:
         app.command_session.open("session-device")
         response_data = {

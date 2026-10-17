@@ -104,7 +104,25 @@ def transcribe_with_quality(
             word_timestamps=False,
             initial_prompt=None,
         )
-        return assess_transcription(list(segments), info.duration, info.duration_after_vad)
+        segment_list = list(segments)
+        result = assess_transcription(segment_list, info.duration, info.duration_after_vad)
+        if not result.accepted_text:
+            if not segment_list:
+                rejection_reason = "no_segments"
+            elif info.duration_after_vad <= 0:
+                rejection_reason = "vad_removed"
+            elif not result.text:
+                rejection_reason = "empty_text"
+            elif result.low_confidence:
+                rejection_reason = "low_confidence"
+            else:
+                rejection_reason = "unknown"
+            technical(
+                "[STT] rejected "
+                f"reason={rejection_reason} segments={len(segment_list)} "
+                f"duration_after_vad={info.duration_after_vad:.2f}"
+            )
+        return result
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail="Não foi possível transcrever o áudio.") from error
     finally:

@@ -18,8 +18,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from koda_core import CoreDecision, InteractionResult
-from services.commands import normalize_text
-from services.conversation import InteractionKind, InteractionMode, extract_wake_command, is_wake_phrase
+from services.commands import (
+    DeviceStateIntent,
+    detect_device_state_intent,
+    is_ambiguous_short_command_noise,
+    normalize_device_state_text,
+    normalize_text,
+)
+from services.conversation import InteractionKind, InteractionMode, is_wake_phrase
 from services.llm import ChatGPTPlanLLMClient
 from services.realtime_audio import RealtimeAudioService
 from services.stt import SAMPLE_RATE, TranscriptionResult, transcribe_with_quality as transcribe_audio, validate_wav
@@ -82,12 +88,17 @@ class TextInteractionPayload(BaseModel):
 
 
 def _conversation_input(
-    transcription: TranscriptionResult | str, use_wake_hotword: bool
+    transcription: TranscriptionResult | str, use_wake_hotword: bool,
+    allow_low_confidence_device_intent: bool = False,
 ) -> tuple[str, bool]:
-    """Mantem mocks legados e so entrega texto de baixa confianca apos a wake."""
+    """Mantem a barreira de wake, exceto para intenções físicas estritas no sono."""
     if isinstance(transcription, str):
         return transcription, False
-    text = transcription.accepted_text if use_wake_hotword else transcription.text
+    text = (
+        transcription.text
+        if allow_low_confidence_device_intent
+        else transcription.accepted_text if use_wake_hotword else transcription.text
+    )
     return text, transcription.low_confidence
 
 
@@ -190,7 +201,11 @@ async def _transcribe(
     technical(f"[STT] mode={'wake' if use_wake_hotword else 'command'}")
     mark_latency("stt_start")
     transcription = transcribe_audio(audio_data, file.filename, use_wake_hotword)
-    text, low_confidence = _conversation_input(transcription, use_wake_hotword)
+    text, low_confidence = _conversation_input(
+        transcription,
+        use_wake_hotword,
+        allow_low_confidence_device_intent=device_sleeping,
+    )
     mark_latency("stt_done")
     latency_metric("stt_ms", "stt_start", "stt_done")
     technical("[STT] transcription completed")
@@ -239,7 +254,11 @@ async def _transcribe_realtime(
     use_wake_hotword = _use_wake_hotword(x_rocky_device, interaction_mode)
     mark_latency("stt_start")
     transcription = transcribe_audio(audio_data, file.filename, use_wake_hotword)
-    text, low_confidence = _conversation_input(transcription, use_wake_hotword)
+    text, low_confidence = _conversation_input(
+        transcription,
+        use_wake_hotword,
+        allow_low_confidence_device_intent=device_sleeping,
+    )
     mark_latency("stt_done")
     latency_metric("stt_ms", "stt_start", "stt_done")
     core_decision = _classify_conversation(
@@ -319,19 +338,49 @@ def _classify_conversation(
     device_sleeping: bool = False,
 ):
     """Conecta a sessão de dispositivo ao Core sem levar estado ao Core."""
+    command_window_was_active = command_session.is_active(device_id)
+    technical(
+        "[DEVICE] route "
+        f"stt_text={text!r} incoming_mode={interaction_mode.value if interaction_mode else 'none'} "
+        f"command_window_active={command_window_was_active} "
+        f"device_state={'sleeping' if device_sleeping else 'active'}"
+    )
     if interaction_mode == InteractionMode.WAKE:
         command_session.close(device_id)
 
     effective_mode = interaction_mode
     if effective_mode is None and command_session.is_active(device_id):
         effective_mode = InteractionMode.COMMAND
+    technical(f"[DEVICE] route effective_mode={effective_mode.value if effective_mode else 'none'}")
+
+    if not text and device_sleeping:
+        info("STT: nenhuma fala confiável; comando de estado não avaliado.")
+        technical("[DEVICE] sleeping: STT text empty before state parser")
+
+    device_state_decision = _device_state_decision(
+        text,
+        device_id,
+        effective_mode,
+        device_sleeping=device_sleeping,
+    )
+    if device_state_decision is not None:
+        direct_result = device_state_decision.direct_result
+        if direct_result is not None and direct_result.interaction_state == "attention":
+            command_session.open(device_id)
+        else:
+            command_session.close(device_id)
+        technical("[DEVICE] route core_called=false direct_device_state=true")
+        return device_state_decision
 
     if device_sleeping:
-        sleeping_decision = _sleeping_device_decision(text, device_id, effective_mode)
-        if sleeping_decision is not None:
-            command_session.close(device_id)
-            return sleeping_decision
+        if effective_mode is not InteractionMode.COMMAND and is_wake_phrase(text):
+            # A wake isolada usa o caminho habitual para abrir a janela existente.
+            pass
+        else:
+            technical("[DEVICE] route core_called=false sleeping_block=true")
+            return _device_state_direct_decision("empty", text, device_id, "", [])
 
+    technical("[DEVICE] route core_called=true")
     core_decision = interaction_service.classify(
         user_id=LOCAL_USER_ID,
         device_id=device_id,
@@ -361,31 +410,78 @@ def _is_sleeping_device_state(value: str) -> bool:
     raise HTTPException(status_code=422, detail="X-Rocky-Device-State invalido.")
 
 
-def _sleeping_device_decision(
-    text: str, device_id: str, interaction_mode: InteractionMode | None,
+def _device_state_decision(
+    text: str,
+    device_id: str,
+    interaction_mode: InteractionMode | None,
+    *,
+    device_sleeping: bool,
 ) -> CoreDecision | None:
-    """Barreira de dispositivo: evita Core/LLM para fala comum durante o sono."""
-    normalized = normalize_text(text)
-    wake_command = extract_wake_command(text)
-    if wake_command == "acorda" or (
-        interaction_mode is InteractionMode.COMMAND and normalized == "acorda"
-    ):
-        return _sleeping_direct_decision(
+    """Intercepta comandos físicos antes do Core e do fluxo LLM."""
+    technical(f'[DEVICE] state={"sleeping" if device_sleeping else "active"} stt_text="{text}"')
+    technical(f'[DEVICE] state normalized="{normalize_device_state_text(text)}"')
+    state_intent = detect_device_state_intent(
+        text,
+        require_wake_word=interaction_mode is not InteractionMode.COMMAND,
+        allow_stt_recovery=interaction_mode is InteractionMode.COMMAND,
+        device_sleeping=device_sleeping,
+    )
+    technical(
+        "[DEVICE] state_intent="
+        f"{state_intent.value if state_intent is not None else 'none'}"
+    )
+
+    if state_intent is DeviceStateIntent.SLEEP_DEVICE:
+        if device_sleeping:
+            return _device_state_direct_decision("empty", text, device_id, "", [])
+        return _device_state_direct_decision(
             "deterministic",
             text,
             device_id,
-            "Acordando.",
-            [{"type": "set_device_state", "state": "active"}],
+            "Vou dormir.",
+            [{"type": "set_device_state", "state": "sleeping"}],
         )
 
-    if interaction_mode is InteractionMode.WAKE and is_wake_phrase(text):
-        return None
+    if state_intent is DeviceStateIntent.WAKE_DEVICE:
+        if device_sleeping:
+            return _device_state_direct_decision(
+                "deterministic",
+                text,
+                device_id,
+                "Acordando.",
+                [{"type": "set_device_state", "state": "active"}],
+                interaction_state="attention",
+            )
+        return _device_state_direct_decision(
+            "deterministic",
+            text,
+            device_id,
+            "Ja estou acordado.",
+            [],
+            interaction_state="attention",
+        )
 
-    return _sleeping_direct_decision("empty", text, device_id, "", [])
+    if (
+        not device_sleeping
+        and interaction_mode is InteractionMode.COMMAND
+        and is_ambiguous_short_command_noise(text)
+    ):
+        technical("[DEVICE] state_intent=ambiguous_short_noise")
+        return _device_state_direct_decision(
+            "empty",
+            text,
+            device_id,
+            "",
+            [],
+            interaction_state="attention",
+        )
+
+    return None
 
 
-def _sleeping_direct_decision(
+def _device_state_direct_decision(
     kind: str, text: str, device_id: str, response_text: str, actions: list[dict[str, object]],
+    interaction_state: str = "idle",
 ) -> CoreDecision:
     return CoreDecision(
         kind=kind,
@@ -394,7 +490,7 @@ def _sleeping_direct_decision(
         user_id=LOCAL_USER_ID,
         direct_result=InteractionResult(
             text=response_text,
-            interaction_state="idle",
+            interaction_state=interaction_state,
             actions=actions,
         ),
     )

@@ -112,14 +112,14 @@ bool SttClient::checkHealth()
 }
 
 bool SttClient::transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendResponse& response,
-                          bool postWakeCommand)
+                          bool postWakeCommand, bool deviceSleeping)
 {
     WiFiClient client;
     client.setTimeout(HTTP_TIMEOUT_MS);
 
     Serial.println("[STT] sending speech...");
     if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) ||
-        !sendMultipartRequest(client, pcm16, pcmByteCount, postWakeCommand))
+        !sendMultipartRequest(client, pcm16, pcmByteCount, postWakeCommand, deviceSleeping))
     {
         Serial.println("[STT] error=connection");
         client.stop();
@@ -146,13 +146,13 @@ bool SttClient::transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendRes
 }
 
 bool SttClient::transcribeRealtime(const int16_t* pcm16, size_t pcmByteCount, RealtimeResponse& response,
-                                  bool postWakeCommand)
+                                  bool postWakeCommand, bool deviceSleeping)
 {
     response = {};
     WiFiClient client;
     client.setTimeout(HTTP_TIMEOUT_MS);
     if (!client.connect(STT_SERVER_HOST, STT_SERVER_PORT) ||
-        !sendRealtimeMultipartRequest(client, pcm16, pcmByteCount, postWakeCommand))
+        !sendRealtimeMultipartRequest(client, pcm16, pcmByteCount, postWakeCommand, deviceSleeping))
     {
         client.stop();
         return false;
@@ -539,7 +539,7 @@ bool SttClient::sendGetRequest(WiFiClient& client) const
 
 bool SttClient::sendMultipartRequest(WiFiClient& client,
                                      const int16_t* pcm16,
-                                     size_t pcmByteCount, bool postWakeCommand) const
+                                     size_t pcmByteCount, bool postWakeCommand, bool deviceSleeping) const
 {
     const size_t contentLength = sizeof(MULTIPART_PREFIX) - 1 + WAV_HEADER_SIZE + pcmByteCount +
                                  sizeof(MULTIPART_SUFFIX) - 1;
@@ -548,6 +548,7 @@ bool SttClient::sendMultipartRequest(WiFiClient& client,
         "Host: %s:%u\r\n"
         "X-Rocky-Device: %s\r\n"
         "X-Rocky-Interaction-Mode: %s\r\n"
+        "X-Rocky-Device-State: %s\r\n"
         "Content-Type: multipart/form-data; boundary=%s\r\n"
         "Content-Length: %u\r\n"
         "Connection: close\r\n\r\n",
@@ -555,6 +556,7 @@ bool SttClient::sendMultipartRequest(WiFiClient& client,
         STT_SERVER_PORT,
         DEVICE_ID,
         postWakeCommand ? "command" : "wake",
+        deviceSleeping ? "sleeping" : "active",
         MULTIPART_BOUNDARY,
         static_cast<unsigned>(contentLength));
     if (headerWritten <= 0 ||
@@ -585,12 +587,12 @@ bool SttClient::sendMultipartRequest(WiFiClient& client,
 
 bool SttClient::sendRealtimeMultipartRequest(WiFiClient& client,
                                              const int16_t* pcm16,
-                                             size_t pcmByteCount, bool postWakeCommand) const
+                                             size_t pcmByteCount, bool postWakeCommand, bool deviceSleeping) const
 {
     const size_t contentLength = sizeof(MULTIPART_PREFIX) - 1 + WAV_HEADER_SIZE + pcmByteCount + sizeof(MULTIPART_SUFFIX) - 1;
-    if (client.printf("POST %s HTTP/1.1\r\nHost: %s:%u\r\nX-Rocky-Device: %s\r\nX-Rocky-Interaction-Mode: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+    if (client.printf("POST %s HTTP/1.1\r\nHost: %s:%u\r\nX-Rocky-Device: %s\r\nX-Rocky-Interaction-Mode: %s\r\nX-Rocky-Device-State: %s\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
                       REALTIME_TRANSCRIBE_PATH, STT_SERVER_HOST, STT_SERVER_PORT, DEVICE_ID,
-                      postWakeCommand ? "command" : "wake", MULTIPART_BOUNDARY,
+                      postWakeCommand ? "command" : "wake", deviceSleeping ? "sleeping" : "active", MULTIPART_BOUNDARY,
                       static_cast<unsigned>(contentLength)) <= 0 ||
         !writeAll(client, reinterpret_cast<const uint8_t*>(MULTIPART_PREFIX), sizeof(MULTIPART_PREFIX) - 1))
         return false;
@@ -940,6 +942,19 @@ bool SttClient::extractBackendResponse(const String& json, BackendResponse& resp
             return false;
         response.action.type = BackendAction::Type::SetVolume;
         response.action.volumePercent = static_cast<uint8_t>(volumePercent);
+    }
+    else if (type == "set_device_state")
+    {
+        String state;
+        if (!extractJsonString(actionJson, "state", state))
+            return false;
+        if (state == "sleeping")
+            response.action.deviceSleeping = true;
+        else if (state == "active")
+            response.action.deviceSleeping = false;
+        else
+            return false;
+        response.action.type = BackendAction::Type::SetDeviceState;
     }
     else
         response.action.value = type;

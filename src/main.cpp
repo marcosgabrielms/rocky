@@ -10,6 +10,7 @@
 #include "core/CommandProcessor.h"
 #include "core/TimeService.h"
 #include "core/InteractionLatency.h"
+#include "core/DeviceActivity.h"
 #include "dataset/DatasetCollector.h"
 #include "audio/SpeechCapture.h"
 #include "audio/VoiceActivityDetector.h"
@@ -175,6 +176,7 @@ uint32_t wifiConnectedAt = 0;
 uint32_t visualCommandWindowStartedAt = 0;
 uint32_t interactionId = 0;
 InteractionLatency interactionLatency;
+DeviceActivity deviceActivity;
 uint32_t calibrationId = 0;
 uint32_t calibrationDistanceCm = 0;
 uint32_t calibrationFirstActiveAt = 0;
@@ -605,7 +607,8 @@ void sendCompletedSpeech()
     SttClient::RealtimeResponse realtimeResponse;
     const bool transcribed = sttClient.transcribeRealtime(speechCapture.getPcm16(),
                                                         speechCapture.getPcmByteCount(), realtimeResponse,
-                                                        capturedPostWakeCommand);
+                                                        capturedPostWakeCommand,
+                                                        deviceActivity.isSleeping());
     if constexpr (ATTENTION_VAD_DIAGNOSTICS)
         attentionVadDiagnostics.httpReturned(millis());
     if (transcribed)
@@ -698,6 +701,13 @@ void handleBackendResponse(const SttClient::BackendResponse& response, bool defe
             Serial.printf("[ACTION] volume=%u%%\n", speaker.getVolumePercent());
         else
             Serial.println("[ACTION] volume persistence failed");
+    }
+    else if (response.action.type == SttClient::BackendAction::Type::SetDeviceState)
+    {
+        if (deviceActivity.setSleeping(response.action.deviceSleeping))
+            Serial.printf("[ACTION] device_state=%s\n", deviceActivity.getStateName());
+        else
+            Serial.println("[ACTION] device state persistence failed");
     }
     else if (!response.action.value.isEmpty())
         Serial.printf("[ACTION] unsupported=%s\n", response.action.value.c_str());
@@ -1012,6 +1022,8 @@ void setup()
     Serial.println("INMP441 inicializado.");
     if (speaker.begin() && SPEAKER_TEST_TONE_ENABLED)
         speaker.playTestTone();
+
+    deviceActivity.begin();
 
     voiceActivityDetector.begin();
     if (!speechCapture.begin())

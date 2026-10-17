@@ -27,13 +27,14 @@ public:
 
     struct BackendAction
     {
-        enum class Type : uint8_t { None, Expression, ShowText, SetVolume };
+        enum class Type : uint8_t { None, Expression, ShowText, SetVolume, SetDeviceState };
         Type type = Type::None;
         String value;
         String line1;
         String line2;
         uint32_t durationMs = 0;
         uint8_t volumePercent = 0;
+        bool deviceSleeping = false;
     };
 
     struct BackendResponse
@@ -62,9 +63,9 @@ public:
 
     bool checkHealth();
     bool transcribe(const int16_t* pcm16, size_t pcmByteCount, BackendResponse& response,
-                    bool postWakeCommand = false);
+                    bool postWakeCommand = false, bool deviceSleeping = false);
     bool transcribeRealtime(const int16_t* pcm16, size_t pcmByteCount, RealtimeResponse& response,
-                            bool postWakeCommand = false);
+                            bool postWakeCommand = false, bool deviceSleeping = false);
     bool playResponseAudio(Speaker& speaker, const PlaybackCallbacks& callbacks);
     bool playRealtimeInteraction(Speaker& speaker, uint32_t interactionId,
                                  const PlaybackCallbacks& callbacks);
@@ -106,10 +107,10 @@ private:
     bool sendGetRequest(WiFiClient& client) const;
     bool sendMultipartRequest(WiFiClient& client,
                               const int16_t* pcm16,
-                              size_t pcmByteCount, bool postWakeCommand) const;
+                              size_t pcmByteCount, bool postWakeCommand, bool deviceSleeping) const;
     bool sendRealtimeMultipartRequest(WiFiClient& client,
                                       const int16_t* pcm16,
-                                      size_t pcmByteCount, bool postWakeCommand) const;
+                                      size_t pcmByteCount, bool postWakeCommand, bool deviceSleeping) const;
     bool playAudioPath(Speaker& speaker, const String& path, const PlaybackCallbacks& callbacks);
     bool playWavResponse(Speaker& speaker, WiFiClient& client, size_t wavSize,
                          const PlaybackCallbacks& callbacks, const uint32_t* sequence = nullptr,

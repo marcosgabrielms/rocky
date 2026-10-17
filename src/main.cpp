@@ -203,6 +203,8 @@ bool backendConversationActive = false;
 bool visualCommandWindowActive = false;
 bool visualCommandWindowPausedForSpeech = false;
 bool capturedPostWakeCommand = false;
+bool wakingAnimationPending = false;
+bool attentionAfterWakingAnimation = false;
 InteractionState interactionState = InteractionState::Idle;
 Eyes::VisualState currentVisualState = Eyes::VisualState::Idle;
 
@@ -214,6 +216,7 @@ void handleWakeWord(const String& text);
 void handleCommand(const String& text);
 void updateCommandWindow(uint32_t now);
 void returnToIdle();
+void resumeAttentionAfterSpeech();
 void setVisualState(Eyes::VisualState state, bool showConfirmation = true);
 void processDiagnosticSerial();
 void updateNoiseMeasurement(float rms);
@@ -626,7 +629,10 @@ void sendCompletedSpeech()
             if (realtimeResponse.backendResponse.audioAvailable)
             {
                 sttClient.playResponseAudio(speaker, playbackCallbacks);
-                returnToIdle();
+                if (realtimeResponse.backendResponse.interactionState == "attention")
+                    resumeAttentionAfterSpeech();
+                else
+                    returnToIdle();
             }
         }
         else
@@ -636,7 +642,10 @@ void sendCompletedSpeech()
                 handleBackendResponse(realtimeResponse.backendResponse, true);
             if (!sttClient.playRealtimeInteraction(speaker, realtimeResponse.interactionId, playbackCallbacks))
                 Serial.println("[RT] interaction_failed");
-            returnToIdle();
+            if (realtimeResponse.backendResponse.interactionState == "attention")
+                resumeAttentionAfterSpeech();
+            else
+                returnToIdle();
         }
         reportCaptureMemory("after_backend_parse");
     }
@@ -671,6 +680,7 @@ void updateSpeakingVisual()
 void handleBackendResponse(const SttClient::BackendResponse& response, bool deferVisualState)
 {
     Serial.printf("[BACKEND] state=%s\n", response.interactionState.c_str());
+    bool showWakingAnimation = false;
 
     if (response.action.type == SttClient::BackendAction::Type::Expression)
     {
@@ -704,8 +714,13 @@ void handleBackendResponse(const SttClient::BackendResponse& response, bool defe
     }
     else if (response.action.type == SttClient::BackendAction::Type::SetDeviceState)
     {
+        const bool wasSleeping = deviceActivity.isSleeping();
         if (deviceActivity.setSleeping(response.action.deviceSleeping))
+        {
             Serial.printf("[ACTION] device_state=%s\n", deviceActivity.getStateName());
+            showWakingAnimation = wasSleeping && !deviceActivity.isSleeping();
+            wakingAnimationPending = showWakingAnimation;
+        }
         else
             Serial.println("[ACTION] device state persistence failed");
     }
@@ -718,7 +733,14 @@ void handleBackendResponse(const SttClient::BackendResponse& response, bool defe
         const bool resumePausedCommandWindow = visualCommandWindowPausedForSpeech;
         interactionState = InteractionState::WaitingCommand;
         backendConversationActive = true;
-        setVisualState(Eyes::VisualState::Attention, false);
+        if (showWakingAnimation && !deferVisualState)
+        {
+            wakingAnimationPending = false;
+            attentionAfterWakingAnimation = true;
+            setVisualState(Eyes::VisualState::Waking, false);
+        }
+        else if (!deferVisualState)
+            setVisualState(Eyes::VisualState::Attention, false);
         if (resumePausedCommandWindow)
         {
             visualCommandWindowActive = true;
@@ -743,7 +765,17 @@ void handleBackendResponse(const SttClient::BackendResponse& response, bool defe
         visualCommandWindowActive = false;
         visualCommandWindowPausedForSpeech = false;
         if (!deferVisualState)
-            setVisualState(Eyes::VisualState::Idle);
+        {
+            if (deviceActivity.isSleeping())
+                setVisualState(Eyes::VisualState::Sleeping, false);
+            else if (showWakingAnimation)
+            {
+                setVisualState(Eyes::VisualState::Waking, false);
+                wakingAnimationPending = false;
+            }
+            else
+                setVisualState(Eyes::VisualState::Idle);
+        }
     }
     else if (response.interactionState != "idle")
         Serial.printf("[BACKEND] unsupported state=%s\n", response.interactionState.c_str());
@@ -833,7 +865,35 @@ void returnToIdle()
     visualCommandWindowActive = false;
     visualCommandWindowPausedForSpeech = false;
     backendConversationActive = false;
-    setVisualState(Eyes::VisualState::Idle);
+    if (deviceActivity.isSleeping())
+        setVisualState(Eyes::VisualState::Sleeping, false);
+    else if (wakingAnimationPending)
+    {
+        wakingAnimationPending = false;
+        setVisualState(Eyes::VisualState::Waking, false);
+    }
+    else
+        setVisualState(Eyes::VisualState::Idle);
+}
+
+void resumeAttentionAfterSpeech()
+{
+    interactionState = InteractionState::WaitingCommand;
+    backendConversationActive = true;
+    visualCommandWindowActive = true;
+    visualCommandWindowPausedForSpeech = false;
+    visualCommandWindowStartedAt = millis();
+    Serial.printf("[BODY] attention timeout started: %lums\n",
+                  static_cast<unsigned long>(ATTENTION_TIMEOUT_MS));
+
+    if (wakingAnimationPending)
+    {
+        wakingAnimationPending = false;
+        attentionAfterWakingAnimation = true;
+        setVisualState(Eyes::VisualState::Waking, false);
+    }
+    else
+        setVisualState(Eyes::VisualState::Attention, false);
 }
 
 void setVisualState(Eyes::VisualState state, bool showConfirmation)
@@ -858,6 +918,10 @@ void setVisualState(Eyes::VisualState state, bool showConfirmation)
             return "THINKING";
         case Eyes::VisualState::Speaking:
             return "SPEAKING";
+        case Eyes::VisualState::Sleeping:
+            return "SLEEPING";
+        case Eyes::VisualState::Waking:
+            return "WAKING";
         }
 
         return "UNKNOWN";
@@ -1024,6 +1088,8 @@ void setup()
         speaker.playTestTone();
 
     deviceActivity.begin();
+    if (deviceActivity.isSleeping())
+        setVisualState(Eyes::VisualState::Sleeping, false);
 
     voiceActivityDetector.begin();
     if (!speechCapture.begin())
@@ -1087,5 +1153,15 @@ void loop()
     if constexpr (ATTENTION_VAD_DIAGNOSTICS)
         attentionVadDiagnostics.report(millis());
     animator.update();
+    if (currentVisualState == Eyes::VisualState::Waking && animator.isWakingComplete())
+    {
+        if (attentionAfterWakingAnimation)
+        {
+            attentionAfterWakingAnimation = false;
+            setVisualState(Eyes::VisualState::Attention, false);
+        }
+        else
+            setVisualState(Eyes::VisualState::Idle, false);
+    }
     reportMicrophoneLevel(millis());
 }

@@ -12,6 +12,7 @@ public:
     void begin();
     void update();
     void setVisualState(Eyes::VisualState state, bool showConfirmation = true);
+    bool isWakingComplete() const;
 
 private:
     enum class BlinkState : uint8_t
@@ -29,6 +30,9 @@ private:
     static constexpr uint32_t ATTENTION_PULSE_STEP_MS = 175;
     static constexpr uint32_t LISTENING_PULSE_STEP_MS = 100;
     static constexpr uint32_t SPEAKING_POSE_INTERVAL_MS = 220;
+    static constexpr uint32_t SLEEPING_PULSE_STEP_MS = 700;
+    static constexpr uint32_t WAKING_OPEN_DELAY_MS = 260;
+    static constexpr uint32_t WAKING_DURATION_MS = 900;
 
     Eyes& eyes;
     Eyes::VisualState visualState = Eyes::VisualState::Idle;
@@ -41,6 +45,8 @@ private:
     uint8_t speakingPoseIndex = 0;
     uint32_t lastPulseAt = 0;
     uint32_t lastSpeakingPoseAt = 0;
+    bool wakingEyesOpened = false;
+    bool wakingCompleted = false;
 
     void updateBlink(uint32_t now);
     void updateIdleGaze(uint32_t now);
@@ -48,8 +54,11 @@ private:
     void updateAttention(uint32_t now);
     void updateListening(uint32_t now);
     void updateSpeaking(uint32_t now);
+    void updateSleeping(uint32_t now);
+    void updateWaking(uint32_t now);
     void applyAttentionPulse();
     void applyListeningPulse();
+    void applySleepingPulse();
     void applyNextIdleGaze();
     void applyNextThinkingGaze();
 };

@@ -13,7 +13,9 @@ public:
         Attention,
         Listening,
         Thinking,
-        Speaking
+        Speaking,
+        Sleeping,
+        Waking
     };
 
     enum class Mood : uint8_t

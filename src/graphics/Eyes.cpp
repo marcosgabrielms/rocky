@@ -11,12 +11,16 @@ constexpr Eyes::EyeConfig LISTENING_EYE{0, 0, 42, 24, 8};
 constexpr Eyes::EyeConfig THINKING_LEFT_EYE{0, -2, 30, 16, 8};
 constexpr Eyes::EyeConfig THINKING_RIGHT_EYE{0, 2, 30, 16, 8};
 constexpr Eyes::EyeConfig SPEAKING_EYE{0, 0, 38, 34, 10};
+constexpr Eyes::EyeConfig SLEEPING_EYE{0, 4, 36, 5, 2};
+constexpr Eyes::EyeConfig WAKING_EYE{0, 0, 38, 40, 10};
 
 constexpr Eyes::FacePreset IDLE_PRESET{IDLE_EYE, IDLE_EYE, true, true, false};
 constexpr Eyes::FacePreset ATTENTION_PRESET{ATTENTION_EYE, ATTENTION_EYE, false, false, false};
 constexpr Eyes::FacePreset LISTENING_PRESET{LISTENING_EYE, LISTENING_EYE, false, false, false};
 constexpr Eyes::FacePreset THINKING_PRESET{THINKING_LEFT_EYE, THINKING_RIGHT_EYE, true, false, false};
 constexpr Eyes::FacePreset SPEAKING_PRESET{SPEAKING_EYE, SPEAKING_EYE, false, false, true};
+constexpr Eyes::FacePreset SLEEPING_PRESET{SLEEPING_EYE, SLEEPING_EYE, false, false, true};
+constexpr Eyes::FacePreset WAKING_PRESET{WAKING_EYE, WAKING_EYE, false, true, false};
 }
 
 Eyes::Eyes(Display& display)
@@ -175,6 +179,10 @@ const Eyes::FacePreset& Eyes::presetFor(VisualState state)
         return THINKING_PRESET;
     case VisualState::Speaking:
         return SPEAKING_PRESET;
+    case VisualState::Sleeping:
+        return SLEEPING_PRESET;
+    case VisualState::Waking:
+        return WAKING_PRESET;
     }
 
     return IDLE_PRESET;

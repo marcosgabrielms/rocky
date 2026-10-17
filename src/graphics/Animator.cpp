@@ -29,6 +29,10 @@ void Animator::update()
         updateThinking(now);
     else if (visualState == Eyes::VisualState::Speaking)
         updateSpeaking(now);
+    else if (visualState == Eyes::VisualState::Sleeping)
+        updateSleeping(now);
+    else if (visualState == Eyes::VisualState::Waking)
+        updateWaking(now);
     eyes.update(now);
 }
 
@@ -54,13 +58,22 @@ void Animator::setVisualState(Eyes::VisualState newState, bool showConfirmation)
 
     attentionPulseIndex = 1;
     listeningPulseIndex = 1;
+    wakingEyesOpened = false;
+    wakingCompleted = false;
 
     if (visualState == Eyes::VisualState::Speaking)
     {
         speakingPoseIndex = 0;
         lastSpeakingPoseAt = lastGazeChangeAt;
     }
+    else if (visualState == Eyes::VisualState::Waking)
+        eyes.setBlinking(true);
     eyes.render();
+}
+
+bool Animator::isWakingComplete() const
+{
+    return wakingCompleted;
 }
 
 void Animator::updateSpeaking(uint32_t now)
@@ -72,6 +85,28 @@ void Animator::updateSpeaking(uint32_t now)
     speakingPoseIndex = (speakingPoseIndex + 1) % 4;
     eyes.setHeightOffset(HEIGHT_OFFSETS[speakingPoseIndex]);
     lastSpeakingPoseAt = now;
+}
+
+void Animator::updateSleeping(uint32_t now)
+{
+    if (now - lastPulseAt < SLEEPING_PULSE_STEP_MS)
+        return;
+
+    applySleepingPulse();
+    lastPulseAt = now;
+}
+
+void Animator::updateWaking(uint32_t now)
+{
+    const uint32_t elapsed = now - stateStartedAt;
+    if (!wakingEyesOpened && elapsed >= WAKING_OPEN_DELAY_MS)
+    {
+        eyes.setBlinking(false);
+        wakingEyesOpened = true;
+    }
+
+    if (elapsed >= WAKING_DURATION_MS)
+        wakingCompleted = true;
 }
 
 void Animator::updateAttention(uint32_t now)
@@ -188,4 +223,10 @@ void Animator::applyListeningPulse()
 {
     constexpr int16_t HEIGHT_OFFSETS[] = {0, 3};
     eyes.setHeightOffset(HEIGHT_OFFSETS[listeningPulseIndex++ % 2]);
+}
+
+void Animator::applySleepingPulse()
+{
+    constexpr int16_t HEIGHT_OFFSETS[] = {0, 1, 2, 1};
+    eyes.setHeightOffset(HEIGHT_OFFSETS[attentionPulseIndex++ % 4]);
 }

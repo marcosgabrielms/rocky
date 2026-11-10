@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import Thread
 from contextvars import copy_context
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -26,7 +27,7 @@ from services.commands import (
     normalize_text,
 )
 from services.conversation import InteractionKind, InteractionMode, is_wake_phrase
-from services.llm import ChatGPTPlanLLMClient
+from services.llm import build_llm_client
 from services.realtime_audio import RealtimeAudioService
 from services.stt import SAMPLE_RATE, TranscriptionResult, transcribe_with_quality as transcribe_audio, validate_wav
 from services.tts import LocalResponseSpeaker, PiperTTS, RealtimeTTS, get_local_playback_enabled
@@ -49,7 +50,9 @@ REALTIME_LONG_POLL_MAX_MS = 1000
 REALTIME_LONG_POLL_INTERVAL_MS = 50
 LOCAL_USER_ID = "local-user"
 
-llm_client = ChatGPTPlanLLMClient()
+# Variáveis já definidas no ambiente têm prioridade sobre o arquivo local.
+load_dotenv(Path(__file__).parent / ".env", override=False)
+llm_client = build_llm_client(os.environ)
 runtime = KodaRuntime.create(llm_client)
 
 

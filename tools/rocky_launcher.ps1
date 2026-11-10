@@ -45,11 +45,47 @@ if (-not (Test-Path -LiteralPath $pythonPath)) {
     exit 1
 }
 
+$envFilePath = Join-Path $serverPath ".env"
+
+function Get-KodaSetting([string]$name) {
+    $processValue = [Environment]::GetEnvironmentVariable($name)
+    if (-not [string]::IsNullOrWhiteSpace($processValue)) {
+        return $processValue.Trim()
+    }
+    if (-not (Test-Path -LiteralPath $envFilePath)) {
+        return ""
+    }
+    foreach ($line in Get-Content -LiteralPath $envFilePath -Encoding UTF8) {
+        if ($line -match "^\s*$name\s*=\s*(.*)$") {
+            return $Matches[1].Trim().Trim('"').Trim("'")
+        }
+    }
+    return ""
+}
+
+$llmProvider = (Get-KodaSetting "KODA_LLM_PROVIDER").ToLowerInvariant()
+if ([string]::IsNullOrWhiteSpace($llmProvider)) {
+    $llmProvider = "gemini"
+}
+
 Push-Location $serverPath
 try {
-    & $pythonPath -B (Join-Path $serverPath "tools\chatgpt_auth.py")
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[KODA] A API não foi iniciada: sessão ChatGPT indisponível."
+    if ($llmProvider -eq "gemini") {
+        if ([string]::IsNullOrWhiteSpace((Get-KodaSetting "GEMINI_API_KEY"))) {
+            Write-Host "[KODA] A API não foi iniciada: GEMINI_API_KEY ausente em $envFilePath"
+            exit 1
+        }
+        Write-Host "[KODA] Cérebro: Gemini."
+    }
+    elseif ($llmProvider -eq "chatgpt_plan") {
+        & $pythonPath -B (Join-Path $serverPath "tools\chatgpt_auth.py")
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[KODA] A API não foi iniciada: sessão ChatGPT indisponível."
+            exit 1
+        }
+    }
+    else {
+        Write-Host "[KODA] A API não foi iniciada: KODA_LLM_PROVIDER inválido ($llmProvider)."
         exit 1
     }
     Write-Host "[KODA] Iniciando backend..."

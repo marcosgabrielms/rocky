@@ -189,10 +189,12 @@ class ChatGPTPlanLLMClientTest(unittest.TestCase):
 
 
 class ChatGPTPlanDefaultIntegrationTest(unittest.TestCase):
-    def test_app_uses_chatgpt_plan_as_default_provider(self):
+    def test_app_builds_provider_from_configuration(self):
         import app
+        from services.llm import build_llm_client
 
-        self.assertIsInstance(app.llm_client, ChatGPTPlanLLMClient)
+        self.assertIs(type(app.llm_client), type(build_llm_client(os.environ)))
+        self.assertIsInstance(build_llm_client({"KODA_LLM_PROVIDER": "chatgpt_plan"}), ChatGPTPlanLLMClient)
 
 
 if __name__ == "__main__":

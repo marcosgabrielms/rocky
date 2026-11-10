@@ -6,6 +6,8 @@
 .vscode/c_cpp_properties.json
 .vscode/ipch/
 .vscode/launch.json
+# Sugestões geradas pelo "pio project init" quando o arquivo já existe
+*.optional
 
 # -------------------------------
 # Compiled files
